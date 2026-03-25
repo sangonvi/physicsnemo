@@ -17,8 +17,21 @@
 # Dataset type
 type: hrrr_mini
 # Path to .nc data file. Must be overridden.
-data_path: ???
+data_path: "../../data/corrdiff_dataset.nc"
 # Path to json stats file. Must be overriden.
-stats_path: ???
+stats_path: "../../data/stats.json"
 # Names of output channels. Must be overridden.
-output_variables: ['10u', '10v']
+input_variables: [
+    "t2m",
+    "u10",
+    "v10",
+    "sp",
+]
+output_variables: [
+    "t2m",
+    "u10",
+    "v10",
+    "sp",
+]
+
+

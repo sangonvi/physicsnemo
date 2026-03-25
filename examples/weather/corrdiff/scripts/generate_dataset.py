@@ -5,11 +5,13 @@ import xarray as xr
 import cfgrib
 from scipy.ndimage import gaussian_filter
 from tqdm import tqdm
+from netCDF4 import Dataset
+import json
 import warnings
 warnings.filterwarnings('ignore')
 
 # ==============================
-# CONFIGURAÇÃO
+# CONFIGURATION
 # ==============================
 
 DATE = "20240101"
@@ -25,7 +27,7 @@ VARIABLES = [
 PATCH_SIZE = 128
 STRIDE = 128
 
-DATA_DIR = "hrrr_data"
+DATA_DIR = "../data/hrrr_data"
 os.makedirs(DATA_DIR,exist_ok=True)
 
 # ==============================
@@ -49,7 +51,7 @@ def download_hrrr(date,hour):
     return file
 
 # ==============================
-# 2 DETECTAR VARIÁVEIS
+# 2 LOAD VARIABLES
 # ==============================
 
 def load_variables(file):
@@ -69,7 +71,7 @@ def load_variables(file):
 
 
 # ==============================
-# 3 EXTRAIR CAMPOS
+# 3 EXTRACT FIELDS
 # ==============================
 
 def extract_fields(files):
@@ -94,7 +96,7 @@ def extract_fields(files):
     return stacks
 
 # ==============================
-# 4 EXTRAIR PATCHES
+# 4 EXTRACT PATCHES
 # ==============================
 
 def extract_patches(field,size,stride):
@@ -115,7 +117,7 @@ def extract_patches(field,size,stride):
     return np.array(patches)
 
 # ==============================
-# 5 GERAR DATASET
+# 5 GENERATE DATASET
 # ==============================
 
 def build_dataset(fields):
@@ -135,10 +137,13 @@ def build_dataset(fields):
 
     return inputs,outputs
 
+# ==============================
+# 6 SAVE DATASET
+# ==============================
+
 def save_dataset(inputs, outputs, filename="../data/corrdiff_dataset.nc"):
 
     variables = list(inputs.keys())
-
     sample_var = inputs[variables[0]]
 
     N = sample_var.shape[0]
@@ -243,6 +248,27 @@ def save_dataset(inputs, outputs, filename="../data/corrdiff_dataset.nc"):
 
     print("Dataset salvo:", filename)
     
+def generate_stats():
+    ds = xr.open_dataset("../data/corrdiff_dataset.nc", group="input")
+
+    stats = {}
+
+    stats["input"] = {}
+    for v in ds.data_vars:
+        data = ds[v].values
+        stats["input"][v] = {
+            "mean": float(np.mean(data)),
+            "std": float(np.std(data))
+        }
+
+    stats["output"] = stats["input"]
+    stats["invariant"] = {
+        "elev_mean":{"mean":0,"std":1},
+        "lsm_mean":{"mean":0,"std":1}
+    }
+
+    json.dump(stats,open("../data/stats.json","w"),indent=2)   
+    
 # ==============================
 # PIPELINE
 # ==============================
@@ -251,19 +277,23 @@ def main():
 
     files=[]
 
+    print("Downloading HRRR files...")
     for h in HOURS:
         f=download_hrrr(DATE,h)
         files.append(f)
 
+    print("Extracting fields...")
     fields=extract_fields(files)
 
+    print("Building dataset...")
     inputs,outputs=build_dataset(fields)
 
     save_dataset(inputs,outputs)
+    print("Dataset generated: corrdiff/data/corrdiff_dataset.nc")
 
-    print("Dataset gerado: corrdiff_dataset.nc")
-
-
+    print("Generating stats...")
+    generate_stats()
+    
 if __name__=="__main__":
     main()
     
