@@ -193,10 +193,6 @@ _PACKAGE_HINTS: Dict[str, str] = {
         "scikit-learn",
         direct_install="scikit-learn",
     ),
-    "scikit-image": _format_install_hint(  # To be removed with utils/mesh/
-        "scikit-image",
-        direct_install="scikit-image",
-    ),
     # Data format packages
     "xarray": _format_install_hint(
         "xarray",
@@ -273,7 +269,8 @@ _PACKAGE_HINTS: Dict[str, str] = {
     # Neural network extras
     "natten": _format_install_hint(
         "natten",
-        group="nn-extras",
+        direct_hint='pip install "nvidia-physicsnemo[cu12,natten-cu12]" or pip install "nvidia-physicsnemo[cu13,natten-cu13]"',
+        docs_url="https://natten.org/install/",
     ),
     "earth2grid": _format_install_hint(
         "earth2grid",
@@ -306,10 +303,6 @@ _PACKAGE_HINTS: Dict[str, str] = {
         direct_install="shapely",
     ),
     # Miscellaneous
-    "sparse_dot_mkl": _format_install_hint(
-        "sparse_dot_mkl",
-        direct_install="sparse_dot_mkl",
-    ),
     "wrapt": _format_install_hint(
         "wrapt",
         direct_install="wrapt",

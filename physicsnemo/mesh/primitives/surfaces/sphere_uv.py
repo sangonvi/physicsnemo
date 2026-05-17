@@ -20,6 +20,7 @@ Dimensional: 2D manifold in 3D space (closed, no boundary).
 """
 
 import torch
+from jaxtyping import Int
 
 from physicsnemo.mesh.mesh import Mesh
 
@@ -29,12 +30,13 @@ def load(
     theta_resolution: int = 30,
     phi_resolution: int = 30,
     device: torch.device | str = "cpu",
-) -> Mesh:
-    """Create a UV sphere using latitude/longitude parameterization.
+) -> Mesh[2, 3]:
+    r"""Create a UV sphere using latitude/longitude parameterization.
 
     The sphere is generated using spherical coordinates:
-    - phi (latitude): 0 at north pole, π at south pole
-    - theta (longitude): 0 to 2π around the equator
+
+    - :math:`\varphi` (latitude): 0 at north pole, :math:`\pi` at south pole.
+    - :math:`\theta` (longitude): 0 to :math:`2\pi` around the equator.
 
     Poles are handled with triangle fans; the body uses quad strips.
 
@@ -51,7 +53,7 @@ def load(
 
     Returns
     -------
-    Mesh
+    Mesh[2, 3]
         Mesh with n_manifold_dims=2, n_spatial_dims=3.
 
     Examples
@@ -137,7 +139,7 @@ def _triangulate_pole_fan(
     n_angular: int,
     pole_is_north: bool,
     device: torch.device | str,
-) -> torch.Tensor:
+) -> Int[torch.Tensor, "n_angular 3"]:
     """Triangulate a fan from a pole to an adjacent ring (vectorized).
 
     Parameters
@@ -173,7 +175,7 @@ def _triangulate_pole_fan(
 
 def _triangulate_ring_quads(
     n_rings: int, n_angular: int, ring_offset: int, device: torch.device | str
-) -> torch.Tensor:
+) -> Int[torch.Tensor, "n_triangles 3"]:
     """Triangulate quads between concentric rings (vectorized).
 
     Parameters

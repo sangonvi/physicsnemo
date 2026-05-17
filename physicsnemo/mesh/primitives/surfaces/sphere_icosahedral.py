@@ -33,7 +33,7 @@ def load(
     radius: float = 1.0,
     subdivisions: int = 2,
     device: torch.device | str = "cpu",
-) -> Mesh:
+) -> Mesh[2, 3]:
     """Create a sphere by subdividing an icosahedron and projecting to sphere.
 
     This method produces a more uniform triangulation than UV-parameterized
@@ -47,6 +47,7 @@ def load(
     subdivisions : int
         Number of subdivision levels to apply. Each level quadruples the
         triangle count:
+
         - 0: 20 triangles (base icosahedron)
         - 1: 80 triangles
         - 2: 320 triangles
@@ -57,7 +58,7 @@ def load(
 
     Returns
     -------
-    Mesh
+    Mesh[2, 3]
         Mesh with n_manifold_dims=2, n_spatial_dims=3.
 
     Examples

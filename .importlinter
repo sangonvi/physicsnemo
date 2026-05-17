@@ -13,7 +13,9 @@ containers=
 layers = 
    experimental
    active_learning : diffusion
-   models : datapipes : metrics : domain_parallel
+   sym
+   models : datapipes : metrics : domain_parallel : optim
+   mesh
    nn
    utils
    distributed 
@@ -99,8 +101,21 @@ containers=
 layers = 
    generate
    samplers : metrics
-   noise_schedulers | multi_diffusion | preconditioners | guidance
+   multi_diffusion : preconditioners : guidance
+   noise_schedulers
    utils
+
+[importlinter:contract:physicsnemo-sym]
+name = Control Internal Dependencies in PhysicsNeMo sym
+type = layers
+containers=
+   physicsnemo.sym
+layers = 
+   eq
+   graph
+   computation
+   utils
+   constants
 
 [importlinter:contract:physicsnemo-external-imports]
 name = Prevent Non-listed external imports in physicsnemo

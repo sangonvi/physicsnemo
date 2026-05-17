@@ -25,11 +25,30 @@ hole detection (for letters like 'o', 'e', 'a') using the shoelace formula.
 This module requires matplotlib to be installed.
 """
 
-import torch
+from typing import TYPE_CHECKING, Any
 
-from physicsnemo.core.version_check import require_version_spec
+import torch
+from jaxtyping import Float
+
+from physicsnemo.core.version_check import OptionalImport, require_version_spec
 from physicsnemo.mesh.mesh import Mesh
 from physicsnemo.mesh.projections import embed, extrude
+
+### Optional matplotlib submodules. ``OptionalImport`` is a lazy proxy:
+### construction does not import matplotlib; the friendly ``ImportError``
+### (with the ``[mesh-extras]`` install hint) fires only on first attribute
+### access. The ``@require_version_spec("matplotlib")`` decorators on the
+### public entry points raise that same error proactively.
+if TYPE_CHECKING:
+    import matplotlib.font_manager as font_manager
+    import matplotlib.path as mpl_path
+    import matplotlib.textpath as textpath
+    import matplotlib.tri as mpl_tri
+else:
+    font_manager = OptionalImport("matplotlib.font_manager")
+    mpl_path = OptionalImport("matplotlib.path")
+    textpath = OptionalImport("matplotlib.textpath")
+    mpl_tri = OptionalImport("matplotlib.tri")
 
 
 def _compute_polygon_signed_area(vertices) -> float:
@@ -84,12 +103,6 @@ def _text_to_path(text: str, font_size: float = 12.0, samples_per_unit: float = 
     tuple
         Tuple of (points, edges, matplotlib Path object)
     """
-    import importlib
-
-    font_manager = importlib.import_module("matplotlib.font_manager")
-    mpl_path = importlib.import_module("matplotlib.path")
-    textpath = importlib.import_module("matplotlib.textpath")
-
     fp = font_manager.FontProperties(family="sans-serif", weight="bold")
     text_path = textpath.TextPath((0, 0), text, size=font_size, prop=fp)
 
@@ -218,11 +231,7 @@ def _refine_edges(points: torch.Tensor, edges: torch.Tensor, max_length: float):
 
 def _group_letters(text_path):
     """Group polygons into letters using signed area and containment."""
-    import importlib
-
     import numpy as np
-
-    mpl_path = importlib.import_module("matplotlib.path")
 
     path_codes = np.array(text_path.codes)
     closepoly_indices = np.where(path_codes == mpl_path.Path.CLOSEPOLY)[0]
@@ -264,13 +273,11 @@ def _group_letters(text_path):
     return letter_groups
 
 
-def _winding_number(points: torch.Tensor, path) -> torch.Tensor:
+def _winding_number(
+    points: Float[torch.Tensor, "n_points 2"], path: Any
+) -> Float[torch.Tensor, " n_points"]:
     """Compute winding number for path containment test."""
-    import importlib
-
     import numpy as np
-
-    mpl_path = importlib.import_module("matplotlib.path")
 
     path_codes = np.array(path.codes)
     moveto_indices = np.where(path_codes == mpl_path.Path.MOVETO)[0]
@@ -336,12 +343,7 @@ def _get_letter_points(points, edges, text_path, polygon_ranges):
 
 def _triangulate(points, edges, text_path):
     """Triangulate text letter-by-letter with hole support."""
-    import importlib
-
     import numpy as np
-
-    mpl_path = importlib.import_module("matplotlib.path")
-    mpl_tri = importlib.import_module("matplotlib.tri")
 
     letter_groups = _group_letters(text_path)
 
@@ -409,7 +411,7 @@ def text_1d_2d(
     samples_per_unit: float = 10,
     max_segment_length: float = 0.25,
     device: torch.device | str = "cpu",
-) -> Mesh:
+) -> Mesh[1, 2]:
     """Render text as 1D curve in 2D space (boundary path only).
 
     Converts text to a polyline mesh representing the outline of each letter.
@@ -429,7 +431,7 @@ def text_1d_2d(
 
     Returns
     -------
-    Mesh
+    Mesh[1, 2]
         Mesh with n_manifold_dims=1, n_spatial_dims=2 (polyline in 2D)
 
     Examples
@@ -457,7 +459,7 @@ def text_2d_2d(
     samples_per_unit: float = 10,
     max_segment_length: float = 0.25,
     device: torch.device | str = "cpu",
-) -> Mesh:
+) -> Mesh[2, 2]:
     """Render text as 2D triangulated surface in 2D space (filled letters).
 
     Converts text to a filled mesh with proper hole handling for letters
@@ -479,7 +481,7 @@ def text_2d_2d(
 
     Returns
     -------
-    Mesh
+    Mesh[2, 2]
         Mesh with n_manifold_dims=2, n_spatial_dims=2 (filled text in 2D plane)
 
     Examples
@@ -509,7 +511,7 @@ def text_3d_3d(
     max_segment_length: float = 0.25,
     extrusion_height: float = 2.0,
     device: torch.device | str = "cpu",
-) -> Mesh:
+) -> Mesh[3, 3]:
     """Render text as 3D tetrahedral volume (solid extruded text).
 
     Creates solid 3D text by triangulating in 2D, embedding to 3D, and
@@ -532,7 +534,7 @@ def text_3d_3d(
 
     Returns
     -------
-    Mesh
+    Mesh[3, 3]
         Mesh with n_manifold_dims=3, n_spatial_dims=3 (solid tetrahedral volume)
 
     Examples
@@ -579,7 +581,7 @@ def text_2d_3d(
     max_segment_length: float = 0.25,
     extrusion_height: float = 2.0,
     device: torch.device | str = "cpu",
-) -> Mesh:
+) -> Mesh[2, 3]:
     """Render text as 2D boundary surface in 3D space (hollow extruded text).
 
     Creates the surface of 3D text by extracting the boundary from an
@@ -602,7 +604,7 @@ def text_2d_3d(
 
     Returns
     -------
-    Mesh
+    Mesh[2, 3]
         Mesh with n_manifold_dims=2, n_spatial_dims=3 (triangulated surface in 3D)
 
     Examples
