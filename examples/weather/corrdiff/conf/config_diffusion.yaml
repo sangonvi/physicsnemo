@@ -1,0 +1,100 @@
+defaults:
+  - _self_
+
+model:
+
+  name: diffusion
+
+  hr_mean_conditioning: true
+
+  model_args:
+
+    img_resolution: [32, 32]
+
+    model_channels: 128
+
+    channel_mult: [1, 2, 2, 4]
+
+    attn_resolutions: [16]
+
+    num_blocks: 3
+
+    dropout: 0.1
+
+    embedding_type: positional
+
+    channel_mult_noise: 2
+
+    encoder_type: residual
+
+    decoder_type: standard
+
+    resample_filter: [1, 1]
+
+    N_grid_channels: 0
+
+dataset:
+
+  type: zarr
+
+  path: datasets/corrdiff/train.zarr
+
+  normalization_path: datasets/corrdiff/normalization.npz
+
+  train_indices: datasets/corrdiff/train_idx.npy
+
+  valid_indices: datasets/corrdiff/valid_idx.npy
+
+training:
+
+  hp:
+
+    total_batch_size: 32
+
+    batch_size_per_gpu: 4
+
+    lr: 2e-4
+
+    training_duration: 1000000
+
+    lr_rampup: 10000
+
+    lr_decay: 0.9999
+
+    lr_decay_rate: 10000
+
+    grad_clip_threshold: 1.0
+
+    distribution: normal
+
+    P_mean: -1.2
+
+    P_std: 1.2
+
+  perf:
+
+    fp_optimizations: amp-bf16
+
+    dataloader_workers: 8
+
+    torch_compile: false
+
+  io:
+
+    checkpoint_dir: checkpoints/diffusion
+
+    regression_checkpoint_path: checkpoints/regression
+
+    save_checkpoint_freq: 10000
+
+    validation_freq: 5000
+
+    validation_steps: 20
+
+    print_progress_freq: 1000
+
+wandb:
+
+  mode: offline
+
+  watch_model: false

@@ -25,13 +25,14 @@ from physicsnemo.diffusion.utils import InfiniteSampler
 from physicsnemo.distributed import DistributedManager
 
 from datasets import base, cwb, hrrrmini, gefs_hrrr
-
+from datasets.zarr_dataset import ZarrCorrDiffDataset
 
 # this maps all known dataset types to the corresponding init function
 known_datasets = {
     "cwb": cwb.get_zarr_dataset,
     "hrrr_mini": hrrrmini.HRRRMiniDataset,
     "gefs_hrrr": gefs_hrrr.HrrrForecastGEFSDataset,
+    'zarr_corrdiff': ZarrCorrDiffDataset,
 }
 
 
@@ -152,7 +153,21 @@ def init_dataset_from_config(
         del dataset_cfg["validation"]
     dataset_init_func = known_datasets[dataset_type]
 
-    dataset_obj = dataset_init_func(**dataset_cfg)
+    # dataset_obj = dataset_init_func(**dataset_cfg)
+    if dataset_type == "radar_corrdiff":
+
+        normalization_cfg = dataset_cfg.pop(
+            "normalization",
+            {}
+        )
+
+        dataset_obj = dataset_init_func(
+            normalization=normalization_cfg,
+            **dataset_cfg
+        )
+    else:
+        dataset_obj = dataset_init_func(**dataset_cfg)
+        
     if dataloader_cfg is None:
         dataloader_cfg = {}
 

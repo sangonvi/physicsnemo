@@ -1,0 +1,90 @@
+defaults:
+  - _self_
+
+model:
+  name: regression
+
+  hr_mean_conditioning: false
+
+  model_args:
+
+    img_resolution: [32, 32]
+
+    model_channels: 64
+
+    channel_mult: [1, 2, 2, 4]
+
+    attn_resolutions: [16]
+
+    num_blocks: 2
+
+    dropout: 0.1
+
+    embedding_type: positional
+
+    channel_mult_noise: 1
+
+    encoder_type: standard
+    decoder_type: standard
+
+    resample_filter: [1, 1]
+
+    N_grid_channels: 0
+
+dataset:
+
+  type: zarr
+
+  path: datasets/corrdiff/train.zarr
+
+  normalization_path: datasets/corrdiff/normalization.npz
+
+  train_indices: datasets/corrdiff/train_idx.npy
+
+  valid_indices: datasets/corrdiff/valid_idx.npy
+
+training:
+
+  hp:
+
+    total_batch_size: 64
+
+    batch_size_per_gpu: 8
+
+    lr: 1e-4
+
+    training_duration: 200000
+
+    lr_rampup: 10000
+
+    lr_decay: 0.999
+
+    lr_decay_rate: 5000
+
+    grad_clip_threshold: 1.0
+
+  perf:
+
+    fp_optimizations: amp-bf16
+
+    dataloader_workers: 8
+
+    torch_compile: false
+
+  io:
+
+    checkpoint_dir: checkpoints/regression
+
+    save_checkpoint_freq: 10000
+
+    validation_freq: 5000
+
+    validation_steps: 20
+
+    print_progress_freq: 1000
+
+wandb:
+
+  mode: offline
+
+  watch_model: false
