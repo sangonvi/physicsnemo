@@ -10,6 +10,9 @@ model:
 
     img_resolution: [32, 32]
 
+    in_channels: 2
+    out_channels: 1
+
     model_channels: 64
 
     channel_mult: [1, 2, 2, 4]
@@ -35,25 +38,25 @@ dataset:
 
   type: zarr
 
-  path: datasets/corrdiff/train.zarr
+  path: /home/sangonvi/Cefet/datasets/corrdiff/train.zarr
 
-  normalization_path: datasets/corrdiff/normalization.npz
+  normalization_path: /home/sangonvi/Cefet/datasets/corrdiff/normalization.npz
 
-  train_indices: datasets/corrdiff/train_idx.npy
+  train_indices: /home/sangonvi/Cefet/datasets/corrdiff/train_idx.npy
 
-  valid_indices: datasets/corrdiff/valid_idx.npy
+  valid_indices: /home/sangonvi/Cefet/datasets/corrdiff/valid_idx.npy
 
 training:
 
   hp:
 
-    total_batch_size: 64
+    total_batch_size: 32
 
-    batch_size_per_gpu: 8
+    batch_size_per_gpu: 4
 
     lr: 1e-4
 
-    training_duration: 200000
+    training_duration: 300000
 
     lr_rampup: 10000
 
@@ -70,6 +73,12 @@ training:
     dataloader_workers: 8
 
     torch_compile: false
+
+    persistent_workers: true
+
+    pin_memory: true
+
+    prefetch_factor: 4
 
   io:
 
