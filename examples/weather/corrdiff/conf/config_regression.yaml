@@ -13,13 +13,13 @@ model:
     in_channels: 2
     out_channels: 1
 
-    model_channels: 64
+    model_channels: 16
 
-    channel_mult: [1, 2, 2, 4]
+    channel_mult: [1, 2, 2]
 
     attn_resolutions: [16]
 
-    num_blocks: 2
+    num_blocks: 1
 
     dropout: 0.1
 
@@ -35,44 +35,50 @@ model:
     N_grid_channels: 0
 
 dataset:
+  type: /home/vsantos/rionowcast/repositories/physicsnemo/examples/weather/corrdiff/datasets/zarr_dataset.py::ZarrCorrDiffDataset
+    #type: ~/rionowcast/repositories/physicsnemo/examples/weather/corrdiff/datasets/zarr_dataset.py::ZarrCorrDiffDataset
 
-  type: zarr
+  path: /home/vsantos/rionowcast/datasets/corrdiff/train.zarr
 
-  path: /home/sangonvi/Cefet/datasets/corrdiff/train.zarr
+  normalization_path: /home/vsantos/rionowcast/datasets/corrdiff/normalization.npz
 
-  normalization_path: /home/sangonvi/Cefet/datasets/corrdiff/normalization.npz
+  train_indices: home/vsantos/rionowcast/datasets/corrdiff/train_idx.npy
 
-  train_indices: /home/sangonvi/Cefet/datasets/corrdiff/train_idx.npy
-
-  valid_indices: /home/sangonvi/Cefet/datasets/corrdiff/valid_idx.npy
+  valid_indices: home/vsantos/rionowcast/datasets/corrdiff/valid_idx.npy
 
 training:
 
   hp:
 
-    total_batch_size: 32
+    total_batch_size: 8
 
-    batch_size_per_gpu: 4
+    batch_size_per_gpu: 1
 
     lr: 1e-4
 
-    training_duration: 300000
+    training_duration: 1000
 
-    lr_rampup: 10000
+    lr_rampup: 100
 
     lr_decay: 0.999
 
-    lr_decay_rate: 5000
+    lr_decay_rate: 500
 
     grad_clip_threshold: 1.0
 
   perf:
 
-    fp_optimizations: amp-bf16
+    fp_optimizations: none
 
-    dataloader_workers: 8
+    dataloader_workers: 2
 
     torch_compile: false
+
+    songunet_checkpoint_level: 0
+
+    cudnn_benchmark: false
+
+    find_unused_parameters: false
 
     persistent_workers: true
 
@@ -84,16 +90,18 @@ training:
 
     checkpoint_dir: checkpoints/regression
 
-    save_checkpoint_freq: 10000
+    save_checkpoint_freq: 100
 
-    validation_freq: 5000
+    validation_freq: 50
 
-    validation_steps: 20
+    validation_steps: 2
 
-    print_progress_freq: 1000
+    print_progress_freq: 10
 
 wandb:
 
   mode: offline
 
   watch_model: false
+
+  results_dir: outputs
