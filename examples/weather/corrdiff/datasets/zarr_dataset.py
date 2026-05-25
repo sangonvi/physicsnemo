@@ -56,196 +56,91 @@ class ZarrCorrDiffDataset(Dataset):
     def __init__(
         self,
         path,
-        indices=None,
         normalization_path=None,
-        apply_input_normalization=True,
-        apply_target_normalization=True,
+        train_indices=None,
+        valid_indices=None,
+        mode="train",
+        indices=None,
+        **kwargs,
     ):
 
-        # ============================================================
-        # OPEN ZARR
-        # ============================================================
-
-        self.root = zarr.open(
-            path,
-            mode="r",
-        )
+        self.root = zarr.open(path, mode="r")
 
         self.inputs = self.root["input"]
         self.targets = self.root["target"]
-        self.masks = self.root["mask"]
 
-        # ============================================================
-        # INDICES
-        # ============================================================
+        # ==========================================
+        # SPLITS
+        # ==========================================
 
-        if indices is None:
-            self.indices = np.arange(
-                self.inputs.shape[0]
-            )
+        if indices is not None:
 
-        else:
             self.indices = np.load(indices)
 
-        # ============================================================
-        # NORMALIZATION FLAGS
-        # ============================================================
+        elif mode == "train" and train_indices is not None:
 
-        self.apply_input_normalization = (
-            apply_input_normalization
-        )
+            self.indices = np.load(train_indices)
 
-        self.apply_target_normalization = (
-            apply_target_normalization
-        )
+        elif mode in ["valid", "validation"] and valid_indices is not None:
 
-        # ============================================================
-        # LOAD NORMALIZATION
-        # ============================================================
+            self.indices = np.load(valid_indices)
 
-        self.input_mean = None
-        self.input_std = None
+        else:
 
-        self.target_mean = None
-        self.target_std = None
+            self.indices = np.arange(self.inputs.shape[0])
+
+        # ==========================================
+        # NORMALIZATION
+        # ==========================================
+
+        self.mean = None
+        self.std = None
 
         if normalization_path is not None:
 
             norm = np.load(normalization_path)
 
-            # --------------------------------------------------------
-            # INPUT NORMALIZATION
-            # --------------------------------------------------------
-
-            self.input_mean = norm[
-                "input_mean"
-            ][:, None, None]
-
-            self.input_std = norm[
-                "input_std"
-            ][:, None, None]
-
-            # --------------------------------------------------------
-            # TARGET NORMALIZATION
-            # --------------------------------------------------------
-
-            self.target_mean = norm[
-                "target_mean"
-            ][:, None, None]
-
-            self.target_std = norm[
-                "target_std"
-            ][:, None, None]
-
-    # ============================================================
-    # LENGTH
-    # ============================================================
+            self.mean = norm["mean"][:, None, None]
+            self.std = norm["std"][:, None, None]
 
     def __len__(self):
 
         return len(self.indices)
 
-    # ============================================================
-    # GET ITEM
-    # ============================================================
-
     def __getitem__(self, idx):
 
         idx = self.indices[idx]
-
-        # ------------------------------------------------------------
-        # LOAD INPUT
-        # ------------------------------------------------------------
 
         x = np.asarray(
             self.inputs[idx],
             dtype=np.float32,
         )
 
-        # ------------------------------------------------------------
-        # LOAD TARGET
-        # ------------------------------------------------------------
-
         y = np.asarray(
             self.targets[idx],
             dtype=np.float32,
         )
 
-        # ------------------------------------------------------------
-        # LOAD MASK
-        # ------------------------------------------------------------
+        # ==========================================
+        # NORMALIZATION
+        # ==========================================
 
-        mask = np.asarray(
-            self.masks[idx],
-            dtype=np.float32,
-        )
+        if self.mean is not None:
 
-        # ============================================================
-        # INPUT NORMALIZATION
-        # ============================================================
-
-        if (
-            self.apply_input_normalization
-            and self.input_mean is not None
-        ):
-
-            x = (
-                x - self.input_mean
-            ) / (
-                self.input_std + 1e-6
-            )
-
-        # ============================================================
-        # TARGET NORMALIZATION
-        # ============================================================
-
-        if (
-            self.apply_target_normalization
-            and self.target_mean is not None
-        ):
-
-            # --------------------------------------------------------
-            # LOG1P TRANSFORM
-            # --------------------------------------------------------
-
-            y = np.log1p(y)
-
-            # --------------------------------------------------------
-            # Z-SCORE NORMALIZATION
-            # --------------------------------------------------------
-
-            y = (
-                y - self.target_mean
-            ) / (
-                self.target_std + 1e-6
-            )
-
-        # ============================================================
-        # APPLY MASK
-        # ============================================================
-
-        y = y * mask
-
-        # ============================================================
-        # RETURN
-        # ============================================================
+            x = (x - self.mean) / (self.std + 1e-6)
 
         return (
             torch.from_numpy(y),
             torch.from_numpy(x),
         )
 
-    # ============================================================
-    # CORRDIFF API
-    # ============================================================
+    # ==========================================
+    # METADATA
+    # ==========================================
 
     def input_channels(self):
 
-        return list(
-            range(
-                self.inputs.shape[1]
-            )
-        )
+        return list(range(self.inputs.shape[1]))
 
     def output_channels(self):
 
@@ -257,62 +152,3 @@ class ZarrCorrDiffDataset(Dataset):
             self.inputs.shape[2],
             self.inputs.shape[3],
         )
-
-    # ============================================================
-    # OPTIONAL HELPERS
-    # ============================================================
-
-    def denormalize_target(
-        self,
-        y,
-    ):
-
-        """
-        Convert normalized radar prediction
-        back to physical reflectivity values.
-        """
-
-        if isinstance(y, torch.Tensor):
-            y = y.cpu().numpy()
-
-        y = (
-            y * self.target_std
-        ) + self.target_mean
-
-        y = np.expm1(y)
-
-        return y
-
-    def normalize_input(
-        self,
-        x,
-    ):
-
-        """
-        Normalize ERA5 input manually.
-        """
-
-        return (
-            x - self.input_mean
-        ) / (
-            self.input_std + 1e-6
-        )
-
-    def normalize_target(
-        self,
-        y,
-    ):
-
-        """
-        Normalize radar target manually.
-        """
-
-        y = np.log1p(y)
-
-        y = (
-            y - self.target_mean
-        ) / (
-            self.target_std + 1e-6
-        )
-
-        return y
