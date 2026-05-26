@@ -10,9 +10,6 @@ model:
 
     img_resolution: [32, 32]
 
-    in_channels: 2
-    out_channels: 1
-
     model_channels: 16
 
     channel_mult: [1, 2, 2]
