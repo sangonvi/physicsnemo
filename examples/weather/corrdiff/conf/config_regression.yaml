@@ -42,9 +42,10 @@ dataset:
 
   normalization_path: /home/vsantos/rionowcast/datasets/corrdiff/normalization.npz
 
-  train_indices: home/vsantos/rionowcast/datasets/corrdiff/train_idx.npy
+  train_indices: /home/vsantos/rionowcast/datasets/corrdiff/train_index.npy
 
-  valid_indices: home/vsantos/rionowcast/datasets/corrdiff/valid_idx.npy
+  valid_indices: /home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy
+
 
 training:
 
