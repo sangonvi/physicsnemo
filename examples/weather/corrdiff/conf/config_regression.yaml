@@ -64,6 +64,8 @@ training:
 
     grad_clip_threshold: 1.0
 
+    
+
   perf:
 
     fp_optimizations: none
@@ -95,6 +97,8 @@ training:
     validation_steps: 2
 
     print_progress_freq: 10
+
+    save_n_recent_checkpoints: 3
 
 wandb:
 
