@@ -100,9 +100,35 @@ class ZarrCorrDiffDataset(Dataset):
 
             norm = np.load(normalization_path)
 
-            self.mean = norm["mean"][:, None, None]
-            self.std = norm["std"][:, None, None]
+            # ==========================================
+            # COMPATIBLE NORMALIZATION LOADING
+            # ==========================================
 
+            if "mean" in norm.files:
+                mean = norm["mean"]
+            elif "input_mean" in norm.files:
+                mean = norm["input_mean"]
+            elif "x_mean" in norm.files:
+                mean = norm["x_mean"]
+            else:
+                raise ValueError(
+                    f"No mean field found in normalization file: {norm.files}"
+                )
+
+            if "std" in norm.files:
+                std = norm["std"]
+            elif "input_std" in norm.files:
+                std = norm["input_std"]
+            elif "x_std" in norm.files:
+                std = norm["x_std"]
+            else:
+                raise ValueError(
+                    f"No std field found in normalization file: {norm.files}"
+                )
+
+            self.mean = mean[:, None, None]
+            self.std = std[:, None, None]
+            
     def __len__(self):
 
         return len(self.indices)
