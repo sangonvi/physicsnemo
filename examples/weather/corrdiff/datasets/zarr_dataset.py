@@ -64,7 +64,6 @@ class ZarrCorrDiffDataset(Dataset):
         **kwargs,
     ):
 
-        print("LEN DATASET:", len(self))
         self.root = zarr.open(path, mode="r")
 
         self.inputs = self.root["input"]
@@ -90,6 +89,7 @@ class ZarrCorrDiffDataset(Dataset):
 
             self.indices = np.arange(self.inputs.shape[0])
 
+        print("LEN DATASET:", len(self))
         # ==========================================
         # NORMALIZATION
         # ==========================================
