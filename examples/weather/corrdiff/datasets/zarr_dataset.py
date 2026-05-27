@@ -64,6 +64,7 @@ class ZarrCorrDiffDataset(Dataset):
         **kwargs,
     ):
 
+        print("LEN DATASET:", len(self))
         self.root = zarr.open(path, mode="r")
 
         self.inputs = self.root["input"]
@@ -136,7 +137,7 @@ class ZarrCorrDiffDataset(Dataset):
     def __getitem__(self, idx):
 
         idx = self.indices[idx]
-
+        print("IDX:", idx)
         x = np.asarray(
             self.inputs[idx],
             dtype=np.float32,
