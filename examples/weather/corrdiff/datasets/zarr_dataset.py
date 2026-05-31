@@ -137,7 +137,7 @@ class ZarrCorrDiffDataset(Dataset):
     def __getitem__(self, idx):
 
         idx = self.indices[idx]
-        print("IDX:", idx)
+     
         x = np.asarray(
             self.inputs[idx],
             dtype=np.float32,
@@ -147,6 +147,15 @@ class ZarrCorrDiffDataset(Dataset):
             self.targets[idx],
             dtype=np.float32,
         )
+        
+                
+        print("IDX:", idx)
+
+        print("INPUT SHAPE:", x.shape)
+        print("TARGET SHAPE:", y.shape)
+
+        print("INPUT MIN/MAX:", x.min(), x.max())
+        print("TARGET MIN/MAX:", y.min(), y.max())
 
         # ==========================================
         # NORMALIZATION
