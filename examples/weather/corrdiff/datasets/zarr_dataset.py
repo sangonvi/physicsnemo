@@ -96,6 +96,8 @@ class ZarrCorrDiffDataset(Dataset):
 
         self.mean = None
         self.std = None
+        self.target_mean = None
+        self.target_std = None
 
         if normalization_path is not None:
 
@@ -129,6 +131,8 @@ class ZarrCorrDiffDataset(Dataset):
 
             self.mean = mean[:, None, None]
             self.std = std[:, None, None]
+            self.target_mean = norm["target_mean"][:, None, None]
+            self.target_std  = norm["target_std"][:, None, None]
             
     def __len__(self):
 
@@ -148,22 +152,17 @@ class ZarrCorrDiffDataset(Dataset):
             dtype=np.float32,
         )
         
-                
-        print("IDX:", idx)
-
-        print("INPUT SHAPE:", x.shape)
-        print("TARGET SHAPE:", y.shape)
-
-        print("INPUT MIN/MAX:", x.min(), x.max())
-        print("TARGET MIN/MAX:", y.min(), y.max())
-
         # ==========================================
         # NORMALIZATION
         # ==========================================
 
         if self.mean is not None:
-
             x = (x - self.mean) / (self.std + 1e-6)
+
+        if self.target_mean is not None:
+            y = (y - self.target_mean) / (
+                self.target_std + 1e-6
+            )
 
         return (
             torch.from_numpy(y),
