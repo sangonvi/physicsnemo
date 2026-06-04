@@ -160,10 +160,14 @@ class ZarrCorrDiffDataset(Dataset):
             x = (x - self.mean) / (self.std + 1e-6)
 
         if self.target_mean is not None:
-            y = (y - self.target_mean) / (
+           #y = np.log1p(y)
+  
+           y = (
+                y - self.target_mean
+            ) / (
                 self.target_std + 1e-6
             )
-
+                
         return (
             torch.from_numpy(y),
             torch.from_numpy(x),

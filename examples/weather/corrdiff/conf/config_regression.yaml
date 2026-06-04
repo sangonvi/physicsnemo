@@ -54,7 +54,7 @@ training:
 
     lr: 1e-4
 
-    training_duration: 1000
+    training_duration: 100000
 
     lr_rampup: 100
 
