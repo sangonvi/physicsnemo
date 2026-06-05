@@ -1,26 +1,20 @@
-from datasets.dataset import (
-    init_train_valid_datasets_from_config,
-    register_dataset
+from physicsnemo import Module
+import torch
+
+model = Module.from_checkpoint(
+    "checkpoints/regression/checkpoints_regression/CorrDiffRegressionUNet.0.100000.mdlus"
 )
-from omegaconf import OmegaConf
 
-cfg = OmegaConf.load("conf/config_regression.yaml")
+model.cpu()
+model.eval()
 
-register_dataset(cfg.dataset.type)
+target, era5 = dataset[0]
 
-dataset, dataset_iterator, val_dataset, val_iterator = \
-    init_train_valid_datasets_from_config(
-        OmegaConf.to_container(cfg.dataset),
-        {},
-        batch_size=1,
-        validation=True,
-        validation_dataset_cfg=OmegaConf.to_container(cfg.validation)
-    )
+with torch.no_grad():
+    pred = model(era5.unsqueeze(0))
 
-print("Input channels:", dataset.input_channels())
-print("Output channels:", dataset.output_channels())
-
-img_clean, img_lr = next(val_iterator)[:2]
-
-print("img_lr:", img_lr.shape)
-print("img_clean:", img_clean.shape)
+print("target:", target.shape)
+print("era5:", era5.shape)
+print("pred:", pred.shape)
+print("pred min:", pred.min())
+print("pred max:", pred.max())
