@@ -1,5 +1,4 @@
 from physicsnemo import Module
-from repositories.physicsnemo.docs.test_scripts.profiling.annotated_code import dataset
 import torch
 from datasets.zarr_dataset import ZarrCorrDiffDataset
 
