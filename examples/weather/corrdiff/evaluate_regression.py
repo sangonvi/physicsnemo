@@ -5,43 +5,41 @@ import matplotlib.pyplot as plt
 from physicsnemo import Module
 from datasets.zarr_dataset import ZarrCorrDiffDataset
 
-
 DEVICE = "cpu"
 
+CHECKPOINT = (
+    "checkpoints/regression/checkpoints_regression/"
+    "CorrDiffRegressionUNet.0.100000.mdlus"
+)
+
+DATASET_PATH = "/home/vsantos/rionowcast/datasets/corrdiff/train.zarr"
+
+NORMALIZATION = "/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz"
+
+VALID_INDICES = "/home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy"
+
+SAMPLE_ID = 464
 
 print("Loading model...")
 
-model = Module.from_checkpoint(
-    "checkpoints/regression/checkpoints_regression/CorrDiffRegressionUNet.0.100000.mdlus"
-)
+model = Module.from_checkpoint(CHECKPOINT)
 
 model.eval()
 model.to(DEVICE)
 
-
 print("Loading dataset...")
 
 dataset = ZarrCorrDiffDataset(
-    path="/home/vsantos/rionowcast/datasets/corrdiff/train.zarr",
-    normalization_path="/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz",
-    valid_indices="/home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy",
-    mode="valid",
+    path=DATASET_PATH,
+    normalization_path=NORMALIZATION,
+    valid_indices=VALID_INDICES,
+    mode="validation",
 )
 
-# --------------------------------------------------
-# sample
-# --------------------------------------------------
-
-sample_id = 464
-
-target, era5 = dataset[sample_id]
+target, era5 = dataset[SAMPLE_ID]
 
 print("target shape:", target.shape)
 print("era5 shape:", era5.shape)
-
-# --------------------------------------------------
-# inference
-# --------------------------------------------------
 
 with torch.no_grad():
 
@@ -54,93 +52,92 @@ pred = pred.cpu()
 
 print("prediction shape:", pred.shape)
 
-# --------------------------------------------------
-# denormalization
-# --------------------------------------------------
-
-norm = np.load(
-    "/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz"
-)
+norm = np.load(NORMALIZATION)
 
 target_mean = norm["target_mean"][0]
 target_std = norm["target_std"][0]
 
-target = target.numpy()
-pred = pred.numpy()
-
-target = target.squeeze(0)
-pred = pred.squeeze()
-
-print("Unique values pred:",
-      len(np.unique(pred)))
-
-print("Unique values target:",
-      len(np.unique(target)))
+target = target.numpy().squeeze()
+pred = pred.numpy().squeeze()
 
 target = target * target_std + target_mean
 pred = pred * target_std + target_mean
 
-print("target min/max/std:",
-      target.min(),
-      target.max(),
-      target.std())
-
-print("pred min/max/std:",
-      pred.min(),
-      pred.max(),
-      pred.std())
-
-print("pred mean :", pred.mean())
-print("target mean :", target.mean())
-print("pred std  :", pred.std())
-print("target std  :", target.std())
-
-# --------------------------------------------------
-# metrics
-# --------------------------------------------------
-
 mse = np.mean((pred - target) ** 2)
-
 mae = np.mean(np.abs(pred - target))
-
 rmse = np.sqrt(mse)
 
-corr = np.corrcoef(
-    pred.flatten(),
-    target.flatten()
-)[0, 1]
+if target.std() > 1e-6 and pred.std() > 1e-6:
+    corr = np.corrcoef(
+        pred.flatten(),
+        target.flatten()
+    )[0, 1]
+else:
+    corr = np.nan
+
+baseline_rmse = np.sqrt(
+    np.mean((target - target.mean()) ** 2)
+)
+
+skill = 1.0 - rmse / baseline_rmse
 
 print()
-print("MAE :", mae)
-print("RMSE:", rmse)
-print("CORR:", corr)
+print("MAE   :", mae)
+print("RMSE  :", rmse)
+print("CORR  :", corr)
+print("SKILL :", skill)
 
-# --------------------------------------------------
-# plots
-# --------------------------------------------------
+vmin = min(target.min(), pred.min())
+vmax = max(target.max(), pred.max())
 
-plt.figure(figsize=(15,5))
+error = pred - target
+
+plt.figure(figsize=(16,5))
 
 plt.subplot(1,3,1)
-plt.imshow(target)
+
+plt.imshow(
+    target,
+    vmin=vmin,
+    vmax=vmax
+)
+
 plt.title("Radar Truth")
 plt.colorbar()
 
 plt.subplot(1,3,2)
-plt.imshow(pred)
-plt.title("Regression Prediction")
+
+plt.imshow(
+    pred,
+    vmin=vmin,
+    vmax=vmax
+)
+
+plt.title("Prediction")
 plt.colorbar()
 
 plt.subplot(1,3,3)
-plt.imshow(pred - target)
-plt.title("Error")
+
+plt.imshow(
+    error,
+    cmap="RdBu_r",
+    vmin=-np.max(np.abs(error)),
+    vmax=np.max(np.abs(error))
+)
+
+plt.title("Prediction Error")
 plt.colorbar()
 
 plt.tight_layout()
 
+output_file = f"regression_sample_{SAMPLE_ID}.png"
+
 plt.savefig(
-    f"regression_sample_{sample_id}.png",
+    output_file,
     dpi=150
 )
+
+print()
+print("Saved:", output_file)
 
 plt.show()
