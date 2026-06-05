@@ -1,5 +1,30 @@
 from physicsnemo import Module
+from repositories.physicsnemo.docs.test_scripts.profiling.annotated_code import dataset
 import torch
+from datasets.zarr_dataset import ZarrCorrDiffDataset
+
+CHECKPOINT = (
+    "checkpoints/regression/checkpoints_regression/"
+    "CorrDiffRegressionUNet.0.100000.mdlus"
+)
+
+DATASET_PATH = "/home/vsantos/rionowcast/datasets/corrdiff/train.zarr"
+
+NORMALIZATION = "/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz"
+
+VALID_INDICES = "/home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy"
+
+
+print("Loading model...")
+
+print("Loading validation dataset...")
+
+dataset = ZarrCorrDiffDataset(
+    path=DATASET_PATH,
+    normalization_path=NORMALIZATION,
+    valid_indices=VALID_INDICES,
+    mode="validation",
+)
 
 model = Module.from_checkpoint(
     "checkpoints/regression/checkpoints_regression/CorrDiffRegressionUNet.0.100000.mdlus"
