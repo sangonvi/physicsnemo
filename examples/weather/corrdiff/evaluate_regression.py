@@ -32,7 +32,7 @@ dataset = ZarrCorrDiffDataset(
 # sample
 # --------------------------------------------------
 
-sample_id = 0
+sample_id = 464
 
 target, era5 = dataset[sample_id]
 
@@ -92,6 +92,8 @@ print("pred min/max/std:",
 
 print("pred mean :", pred.mean())
 print("target mean :", target.mean())
+print("pred std  :", pred.std())
+print("target std  :", target.std())
 
 # --------------------------------------------------
 # metrics
