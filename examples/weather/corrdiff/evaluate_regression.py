@@ -1,9 +1,8 @@
-import torch
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 
 from physicsnemo import Module
-
 from datasets.zarr_dataset import ZarrCorrDiffDataset
 
 
@@ -17,6 +16,7 @@ model = Module.from_checkpoint(
 )
 
 model.eval()
+model.to(DEVICE)
 
 
 print("Loading dataset...")
@@ -25,69 +25,106 @@ dataset = ZarrCorrDiffDataset(
     path="/home/vsantos/rionowcast/datasets/corrdiff/train.zarr",
     normalization_path="/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz",
     valid_indices="/home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy",
-    mode="valid"
+    mode="valid",
 )
+
+# --------------------------------------------------
+# sample
+# --------------------------------------------------
+
+sample_id = 0
+
+target, era5 = dataset[sample_id]
+
+print("target shape:", target.shape)
+print("era5 shape:", era5.shape)
+
+# --------------------------------------------------
+# inference
+# --------------------------------------------------
+
+with torch.no_grad():
+
+    pred = model(
+        x=torch.zeros_like(target).unsqueeze(0).to(DEVICE),
+        img_lr=era5.unsqueeze(0).to(DEVICE)
+    )
+
+pred = pred.cpu()
+
+print("prediction shape:", pred.shape)
+
+# --------------------------------------------------
+# denormalization
+# --------------------------------------------------
 
 norm = np.load(
     "/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz"
 )
 
-target_mean = norm["target_mean"]
-target_std = norm["target_std"]
+target_mean = norm["target_mean"][0]
+target_std = norm["target_std"][0]
 
+target = target.numpy()
+pred = pred.numpy()
 
-rmse_list = []
+target = target.squeeze(0)
+pred = pred.squeeze()
 
+target = target * target_std + target_mean
+pred = pred * target_std + target_mean
 
-for idx in range(len(dataset)):
+# caso tenha usado log1p no target:
+#
+# target = np.expm1(target)
+# pred = np.expm1(pred)
 
-    target, era5 = dataset[idx]
+# --------------------------------------------------
+# metrics
+# --------------------------------------------------
 
-    with torch.no_grad():
+mse = np.mean((pred - target) ** 2)
 
-        pred = model(
-            x=torch.zeros_like(target).unsqueeze(0),
-            img_lr=era5.unsqueeze(0)
-        )
+mae = np.mean(np.abs(pred - target))
 
-    pred = pred.squeeze().cpu().numpy()
-    target = target.numpy()
+rmse = np.sqrt(mse)
 
-    # desnormalização
-
-    pred = pred * target_std[0] + target_mean[0]
-    target = target * target_std[0] + target_mean[0]
-
-    rmse = np.sqrt(
-        np.mean(
-            (pred - target) ** 2
-        )
-    )
-
-    rmse_list.append(rmse)
-
-    if idx < 5:
-
-        plt.figure(figsize=(12,4))
-
-        plt.subplot(131)
-        plt.imshow(target)
-        plt.title("Radar Real")
-
-        plt.subplot(132)
-        plt.imshow(pred)
-        plt.title("Predição")
-
-        plt.subplot(133)
-        plt.imshow(pred - target)
-        plt.title("Erro")
-
-        plt.savefig(f"sample_{idx}.png")
-        plt.close()
-
-    if idx % 100 == 0:
-        print(idx, rmse)
+corr = np.corrcoef(
+    pred.flatten(),
+    target.flatten()
+)[0, 1]
 
 print()
-print("RMSE médio:", np.mean(rmse_list))
-print("RMSE std:", np.std(rmse_list))
+print("MAE :", mae)
+print("RMSE:", rmse)
+print("CORR:", corr)
+
+# --------------------------------------------------
+# plots
+# --------------------------------------------------
+
+plt.figure(figsize=(15,5))
+
+plt.subplot(1,3,1)
+plt.imshow(target)
+plt.title("Radar Truth")
+plt.colorbar()
+
+plt.subplot(1,3,2)
+plt.imshow(pred)
+plt.title("Regression Prediction")
+plt.colorbar()
+
+plt.subplot(1,3,3)
+plt.imshow(pred - target)
+plt.title("Error")
+plt.colorbar()
+
+plt.tight_layout()
+
+plt.savefig(
+    f"regression_sample_{sample_id}.png",
+    dpi=150
+)
+
+plt.show()
