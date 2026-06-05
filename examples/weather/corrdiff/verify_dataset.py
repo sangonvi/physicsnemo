@@ -38,15 +38,15 @@ print("target:", target.shape)
 print("era5:", era5.shape)
 
 
-print(dataset.inputs.shape)
+print("DATA SET INPUT SHAPE:", dataset.inputs.shape)
 
-print(dataset.targets.shape)
+print("DATA SET TARGET SHAPE:", dataset.targets.shape)
 
 sample = dataset.inputs[0]
 
-print(sample.shape)
+print(   "DATA SET SAMPLE SHAPE:", sample.shape)
 
-print(model.model.enc["32x32_conv"].weight.shape)
+print("MODEL ENCODER WEIGHT SHAPE:", model.model.enc["32x32_conv"].weight.shape)
 '''
 with torch.no_grad():
     pred = model(era5.unsqueeze(0))
