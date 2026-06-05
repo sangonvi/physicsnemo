@@ -1,6 +1,7 @@
 from physicsnemo import Module
 import torch
 from datasets.zarr_dataset import ZarrCorrDiffDataset
+import numpy as np
 
 CHECKPOINT = (
     "checkpoints/regression/checkpoints_regression/"
@@ -54,3 +55,40 @@ target, era5 = dataset[max_idx]
 print(target.min())
 print(target.max())
 print(target.std())
+
+all_mae = []
+all_rmse = []
+all_corr = []
+
+for idx in range(len(dataset)):
+
+    target, era5 = dataset[idx]
+
+    with torch.no_grad():
+
+        pred = model(
+            x=torch.zeros_like(target).unsqueeze(0),
+            img_lr=era5.unsqueeze(0)
+        )
+
+    target = target.numpy().squeeze()
+    pred = pred.numpy().squeeze()
+
+    mae = np.mean(np.abs(pred - target))
+    rmse = np.sqrt(np.mean((pred - target) ** 2))
+
+    all_mae.append(mae)
+    all_rmse.append(rmse)
+
+    if target.std() > 1e-6 and pred.std() > 1e-6:
+        corr = np.corrcoef(
+            pred.flatten(),
+            target.flatten()
+        )[0,1]
+
+        all_corr.append(corr)
+
+print()
+print("Mean MAE :", np.mean(all_mae))
+print("Mean RMSE:", np.mean(all_rmse))
+print("Mean CORR:", np.mean(all_corr))
