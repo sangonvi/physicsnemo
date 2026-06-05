@@ -774,6 +774,10 @@ def main(cfg: DictConfig) -> None:
                                     writer.add_scalar(
                                         "validation_loss", average_valid_loss, cur_nimg
                                     )
+                                    logger0.info(
+                                        f"VALIDATION: samples={cur_nimg} "
+                                        f"validation_loss={average_valid_loss.item():.6f}"
+)
 
                 if is_time_for_periodic_task(
                     cur_nimg,
