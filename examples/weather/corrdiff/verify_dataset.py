@@ -37,9 +37,22 @@ target, era5 = dataset[0]
 print("target:", target.shape)
 print("era5:", era5.shape)
 
+
+print(dataset.inputs.shape)
+
+print(dataset.targets.shape)
+
+sample = dataset.inputs[0]
+
+print(sample.shape)
+
+print(model.model.enc["32x32_conv"].weight.shape)
+'''
 with torch.no_grad():
     pred = model(era5.unsqueeze(0))
 
 print("pred:", pred.shape)
 print("pred min:", pred.min())
 print("pred max:", pred.max())
+
+'''
