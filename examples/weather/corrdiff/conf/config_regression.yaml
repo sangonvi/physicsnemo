@@ -33,7 +33,7 @@ model:
 
 dataset:
   type: /home/vsantos/rionowcast/repositories/physicsnemo/examples/weather/corrdiff/datasets/zarr_dataset.py::ZarrCorrDiffDataset
-  
+
   path: /home/vsantos/rionowcast/datasets/corrdiff/train.zarr
 
   normalization_path: /home/vsantos/rionowcast/datasets/corrdiff/normalization.npz
@@ -41,6 +41,17 @@ dataset:
   train_indices: /home/vsantos/rionowcast/datasets/corrdiff/train_index.npy
 
   valid_indices: /home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy
+
+
+#
+# FORÇA O DATASET DE VALIDAÇÃO
+#
+validation:
+
+  indices: /home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy
+
+  mode: validation
+
 
 training:
 
@@ -52,7 +63,10 @@ training:
 
     lr: 1e-4
 
-    training_duration: 100000
+    #
+    # ~31 épocas
+    #
+    training_duration: 500000
 
     lr_rampup: 100
 
@@ -62,7 +76,6 @@ training:
 
     grad_clip_threshold: 1.0
 
-    
 
   perf:
 
@@ -84,19 +97,33 @@ training:
 
     prefetch_factor: 4
 
+
   io:
 
     checkpoint_dir: checkpoints/regression
 
-    save_checkpoint_freq: 100
+    #
+    # salva checkpoint a cada 5000 steps
+    #
+    save_checkpoint_freq: 5000
 
-    validation_freq: 50
+    #
+    # roda validação a cada 2000 steps
+    #
+    validation_freq: 2000
 
-    validation_steps: 2
+    #
+    # estima loss usando 64 batches
+    #
+    validation_steps: 64
 
-    print_progress_freq: 10
+    #
+    # log menos verboso
+    #
+    print_progress_freq: 100
 
-    save_n_recent_checkpoints: 3
+    save_n_recent_checkpoints: 5
+
 
 wandb:
 
