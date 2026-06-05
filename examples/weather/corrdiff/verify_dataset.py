@@ -32,25 +32,25 @@ model = Module.from_checkpoint(
 model.cpu()
 model.eval()
 
-target, era5 = dataset[0]
 
-print(target.shape)
-print(era5.shape)
+max_std = 0
+max_idx = 0
 
-with torch.no_grad():
+for i in range(len(dataset)):
 
-    pred = model(
-        x=torch.zeros_like(target).unsqueeze(0),
-        img_lr=era5.unsqueeze(0)
-    )
+    target, _ = dataset[i]
 
-print(pred.shape)
-'''
-with torch.no_grad():
-    pred = model(era5.unsqueeze(0))
+    s = target.std().item()
 
-print("pred:", pred.shape)
-print("pred min:", pred.min())
-print("pred max:", pred.max())
+    if s > max_std:
+        max_std = s
+        max_idx = i
 
-'''
+print("max_idx =", max_idx)
+print("max_std =", max_std)
+
+target, era5 = dataset[max_idx]
+
+print(target.min())
+print(target.max())
+print(target.std())
