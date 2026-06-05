@@ -101,7 +101,7 @@ training:
 
     checkpoint_dir: checkpoints/regression
 
-    save_checkpoint_freq: 100
+    save_checkpoint_freq: 1250
 
     validation_freq: 50
 
@@ -109,7 +109,7 @@ training:
 
     print_progress_freq: 10
 
-    save_n_recent_checkpoints: 3
+    save_n_recent_checkpoints: 0
 
 
 wandb:
