@@ -1,24 +1,41 @@
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-
+import argparse
 from physicsnemo import Module
 from datasets.zarr_dataset import ZarrCorrDiffDataset
 
-DEVICE = "cpu"
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "--step",
+    type=int,
+    required=True
+)
+
+parser.add_argument(
+    "--sample",
+    type=int,
+    default=464,
+    help="Validation sample id"
+)
+
+args = parser.parse_args()
 
 CHECKPOINT = (
     "checkpoints/regression/checkpoints_regression/"
-    "CorrDiffRegressionUNet.0.100000.mdlus"
+    f"CorrDiffRegressionUNet.0.{args.step}.mdlus"
 )
+
+SAMPLE_ID = args.sample
+
+DEVICE = "cpu"
 
 DATASET_PATH = "/home/vsantos/rionowcast/datasets/corrdiff/train.zarr"
 
 NORMALIZATION = "/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz"
 
 VALID_INDICES = "/home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy"
-
-SAMPLE_ID = 464
 
 print("Loading model...")
 

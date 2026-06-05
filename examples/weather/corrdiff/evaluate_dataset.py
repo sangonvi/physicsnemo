@@ -1,15 +1,25 @@
 import numpy as np
 import torch
-
+import argparse
 from physicsnemo import Module
 from datasets.zarr_dataset import ZarrCorrDiffDataset
 
-DEVICE = "cpu"
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "--step",
+    type=int,
+    required=True
+)
+
+args = parser.parse_args()
 
 CHECKPOINT = (
     "checkpoints/regression/checkpoints_regression/"
-    "CorrDiffRegressionUNet.0.100000.mdlus"
+    f"CorrDiffRegressionUNet.0.{args.step}.mdlus"
 )
+
+DEVICE = "cpu"
 
 DATASET_PATH = "/home/vsantos/rionowcast/datasets/corrdiff/train.zarr"
 
