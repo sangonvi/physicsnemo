@@ -71,13 +71,27 @@ pred = pred.numpy()
 target = target.squeeze(0)
 pred = pred.squeeze()
 
+print("Unique values pred:",
+      len(np.unique(pred)))
+
+print("Unique values target:",
+      len(np.unique(target)))
+
 target = target * target_std + target_mean
 pred = pred * target_std + target_mean
 
-# caso tenha usado log1p no target:
-#
-# target = np.expm1(target)
-# pred = np.expm1(pred)
+print("target min/max/std:",
+      target.min(),
+      target.max(),
+      target.std())
+
+print("pred min/max/std:",
+      pred.min(),
+      pred.max(),
+      pred.std())
+
+print("pred mean :", pred.mean())
+print("target mean :", target.mean())
 
 # --------------------------------------------------
 # metrics
