@@ -34,11 +34,12 @@ model.eval()
 
 target, era5 = dataset[0]
 
+print("target:", target.shape)
+print("era5:", era5.shape)
+
 with torch.no_grad():
     pred = model(era5.unsqueeze(0))
 
-print("target:", target.shape)
-print("era5:", era5.shape)
 print("pred:", pred.shape)
 print("pred min:", pred.min())
 print("pred max:", pred.max())
