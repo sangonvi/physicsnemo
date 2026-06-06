@@ -2,20 +2,21 @@ from physicsnemo import Module
 import torch
 from datasets.zarr_dataset import ZarrCorrDiffDataset
 import numpy as np
+from tqdm import tqdm
 
 CHECKPOINT = (
     "checkpoints/regression/checkpoints_regression/"
     "CorrDiffRegressionUNet.0.100000.mdlus"
 )
 
-#DATASET_PATH = "/home/vsantos/rionowcast/datasets/corrdiff/train.zarr"
-DATASET_PATH = "/home/sangonvi/Cefet/datasets/corrdiff/train.zarr"
+DATASET_PATH = "/home/vsantos/rionowcast/datasets/corrdiff/train.zarr"
+#DATASET_PATH = "/home/sangonvi/Cefet/datasets/corrdiff/train.zarr"
 
-#NORMALIZATION = "/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz"
-NORMALIZATION = "/home/sangonvi/Cefet/datasets/corrdiff/normalization.npz"
+NORMALIZATION = "/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz"
+#NORMALIZATION = "/home/sangonvi/Cefet/datasets/corrdiff/normalization.npz"
 
-#VALID_INDICES = "/home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy"
-VALID_INDICES = "/home/sangonvi/Cefet/datasets/corrdiff/valid_index.npy"
+VALID_INDICES = "/home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy"
+#VALID_INDICES = "/home/sangonvi/Cefet/datasets/corrdiff/valid_index.npy"
 
 print("Loading model...")
 
@@ -25,7 +26,7 @@ dataset = ZarrCorrDiffDataset(
     path=DATASET_PATH,
     normalization_path=NORMALIZATION,
     valid_indices=VALID_INDICES,
-    mode="validation",
+    mode="train",
 )
 
 model = Module.from_checkpoint(
