@@ -98,8 +98,8 @@ baseline_rmse = np.sqrt(
 
 skill = 1.0 - rmse / baseline_rmse
 
-print(pred.mean(), pred.std())
-print(target.mean(), target.std())
+print("PREDICTION: {:.2f} ± {:.2f}".format(pred.mean(), pred.std()))
+print("TARGET: {:.2f} ± {:.2f}".format(target.mean(), target.std()))
 print()
 print("MAE   :", mae)
 print("RMSE  :", rmse)
