@@ -1,4 +1,5 @@
 from physicsnemo import Module
+from repositories.physicsnemo.physicsnemo.datapipes.readers import zarr
 import torch
 from datasets.zarr_dataset import ZarrCorrDiffDataset
 import numpy as np
@@ -29,6 +30,7 @@ dataset = ZarrCorrDiffDataset(
     mode="train",
 )
 
+
 model = Module.from_checkpoint(
     "checkpoints/regression/checkpoints_regression/CorrDiffRegressionUNet.0.100000.mdlus"
 )
@@ -52,11 +54,20 @@ count_gt5 = 0
 
 target_std_sum = 0.0
 
+
+norm = np.load(NORMALIZATION)
+
+target_mean = float(norm["target_mean"][0])
+target_std = float(norm["target_std"][0])
+
 for i in tqdm(range(len(dataset))):
 
     target, _ = dataset[i]
 
     target = target.float()
+
+    # volta para escala física
+    target = target * target_std + target_mean
 
     values = target.flatten()
 
