@@ -8,12 +8,14 @@ CHECKPOINT = (
     "CorrDiffRegressionUNet.0.100000.mdlus"
 )
 
-DATASET_PATH = "/home/vsantos/rionowcast/datasets/corrdiff/train.zarr"
+#DATASET_PATH = "/home/vsantos/rionowcast/datasets/corrdiff/train.zarr"
+DATASET_PATH = "/home/sangonvi/Cefet/datasets/corrdiff/train.zarr"
 
-NORMALIZATION = "/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz"
+#NORMALIZATION = "/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz"
+NORMALIZATION = "/home/sangonvi/Cefet/datasets/corrdiff/normalization.npz"
 
-VALID_INDICES = "/home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy"
-
+#VALID_INDICES = "/home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy"
+VALID_INDICES = "/home/sangonvi/Cefet/datasets/corrdiff/valid_index.npy"
 
 print("Loading model...")
 
@@ -37,58 +39,56 @@ model.eval()
 max_std = 0
 max_idx = 0
 
-for i in range(len(dataset)):
+n_pixels = 0
+
+sum_pixels = 0.0
+sum_pixels_sq = 0.0
+
+count_gt0 = 0
+count_gt1 = 0
+count_gt2 = 0
+count_gt5 = 0
+
+target_std_sum = 0.0
+
+for i in tqdm(range(len(dataset))):
 
     target, _ = dataset[i]
 
-    s = target.std().item()
+    target = target.float()
 
-    if s > max_std:
-        max_std = s
-        max_idx = i
+    values = target.flatten()
 
-print("max_idx =", max_idx)
-print("max_std =", max_std)
+    n_pixels += values.numel()
 
-target, era5 = dataset[max_idx]
+    sum_pixels += values.sum().item()
+    sum_pixels_sq += (values ** 2).sum().item()
 
-print(target.min())
-print(target.max())
-print(target.std())
+    count_gt0 += (values > 0).sum().item()
+    count_gt1 += (values > 1).sum().item()
+    count_gt2 += (values > 2).sum().item()
+    count_gt5 += (values > 5).sum().item()
 
-all_mae = []
-all_rmse = []
-all_corr = []
+    target_std_sum += values.std().item()
 
-for idx in range(len(dataset)):
+dataset_mean = sum_pixels / n_pixels
 
-    target, era5 = dataset[idx]
+dataset_std = (
+    sum_pixels_sq / n_pixels
+    - dataset_mean ** 2
+) ** 0.5
 
-    with torch.no_grad():
+fraction_rain_gt_0 = count_gt0 / n_pixels
+fraction_rain_gt_1 = count_gt1 / n_pixels
+fraction_rain_gt_2 = count_gt2 / n_pixels
+fraction_rain_gt_5 = count_gt5 / n_pixels
 
-        pred = model(
-            x=torch.zeros_like(target).unsqueeze(0),
-            img_lr=era5.unsqueeze(0)
-        )
+mean_target_std = target_std_sum / len(dataset)
 
-    target = target.numpy().squeeze()
-    pred = pred.numpy().squeeze()
-
-    mae = np.mean(np.abs(pred - target))
-    rmse = np.sqrt(np.mean((pred - target) ** 2))
-
-    all_mae.append(mae)
-    all_rmse.append(rmse)
-
-    if target.std() > 1e-6 and pred.std() > 1e-6:
-        corr = np.corrcoef(
-            pred.flatten(),
-            target.flatten()
-        )[0,1]
-
-        all_corr.append(corr)
-
-print()
-print("Mean MAE :", np.mean(all_mae))
-print("Mean RMSE:", np.mean(all_rmse))
-print("Mean CORR:", np.mean(all_corr))
+print(f"dataset_mean        = {dataset_mean:.6f}")
+print(f"dataset_std         = {dataset_std:.6f}")
+print(f"fraction_rain_gt_0  = {fraction_rain_gt_0:.6f}")
+print(f"fraction_rain_gt_1  = {fraction_rain_gt_1:.6f}")
+print(f"fraction_rain_gt_2  = {fraction_rain_gt_2:.6f}")
+print(f"fraction_rain_gt_5  = {fraction_rain_gt_5:.6f}")
+print(f"mean_target_std     = {mean_target_std:.6f}")
