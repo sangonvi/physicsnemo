@@ -123,8 +123,8 @@ training:
 
 wandb:
 
-mode: offline
+  mode: offline
 
-watch_model: false
+  watch_model: false
 
-results_dir: outputs
+  results_dir: outputs
