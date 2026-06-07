@@ -30,18 +30,16 @@ model:
 
     encoder_type: standard
     decoder_type: standard
-
 dataset:
+  type: /home/vsantos/rionowcast/repositories/physicsnemo/examples/weather/corrdiff/datasets/zarr_dataset.py::ZarrCorrDiffDataset
 
-  type: zarr
+  path: /home/vsantos/rionowcast/datasets/corrdiff/train.zarr
 
-  path: /home/sangonvi/Cefet/datasets/corrdiff/train.zarr
+  normalization_path: /home/vsantos/rionowcast/datasets/corrdiff/normalization.npz
 
-  normalization_path: /home/sangonvi/Cefet/datasets/corrdiff/normalization.npz
+  train_indices: /home/vsantos/rionowcast/datasets/corrdiff/train_index.npy
 
-  train_indices: /home/sangonvi/Cefet/datasets/corrdiff/train_idx.npy
-
-  valid_indices: /home/sangonvi/Cefet/datasets/corrdiff/valid_idx.npy
+  valid_indices: /home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy
 
 training:
 
