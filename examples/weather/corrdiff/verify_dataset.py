@@ -1,5 +1,5 @@
 from physicsnemo import Module
-from repositories.physicsnemo.physicsnemo.datapipes.readers import zarr
+import zarr
 import torch
 from datasets.zarr_dataset import ZarrCorrDiffDataset
 import numpy as np
