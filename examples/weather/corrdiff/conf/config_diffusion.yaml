@@ -11,8 +11,11 @@ model:
 
     img_resolution: [32, 32]
 
-    in_channels: 1
-    out_channels: 1
+    # Deve ser igual ao treinamento da regressão
+    N_grid_channels: 0
+
+    # Mantido para compatibilidade com CorrDiff
+    gridtype: sinusoidal
 
     model_channels: 64
 
@@ -30,6 +33,9 @@ model:
 
     encoder_type: standard
     decoder_type: standard
+
+    resample_filter: [1, 1]
+
 dataset:
   type: /home/vsantos/rionowcast/repositories/physicsnemo/examples/weather/corrdiff/datasets/zarr_dataset.py::ZarrCorrDiffDataset
 
@@ -41,34 +47,58 @@ dataset:
 
   valid_indices: /home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy
 
+validation:
+
+  type: /home/vsantos/rionowcast/repositories/physicsnemo/examples/weather/corrdiff/datasets/zarr_dataset.py::ZarrCorrDiffDataset
+
+  path: /home/vsantos/rionowcast/datasets/corrdiff/train.zarr
+
+  normalization_path: /home/vsantos/rionowcast/datasets/corrdiff/normalization.npz
+
+  valid_indices: /home/vsantos/rionowcast/datasets/corrdiff/valid_index.npy
+
+  mode: validation
+
 training:
 
   hp:
 
-    total_batch_size: 16
+    total_batch_size: 8
 
-    batch_size_per_gpu: 2
+    batch_size_per_gpu: 1
 
-    lr: 2e-4
-
-    lr_rampup: 10000
-
-    lr_decay: 1.0
-    lr_decay_rate: 1000000
-
-    grad_clip_threshold: 1.0
+    lr: 1e-4
 
     training_duration: 100000
 
+    lr_rampup: 100
+
+    lr_decay: 0.999
+
+    lr_decay_rate: 500
+
+    grad_clip_threshold: 1.0
+
+
   perf:
 
-    fp_optimizations: fp32
+    fp_optimizations: none
 
-    dataloader_workers: 8
+    dataloader_workers: 2
+
+    torch_compile: false
 
     songunet_checkpoint_level: 0
 
-    torch_compile: false
+    cudnn_benchmark: false
+
+    find_unused_parameters: false
+
+    persistent_workers: true
+
+    pin_memory: true
+
+    prefetch_factor: 4
 
     use_apex_gn: false
 
@@ -78,22 +108,23 @@ training:
 
     regression_checkpoint_path: checkpoints/regression/checkpoints_regression/CorrDiffRegressionUNet.0.100000.mdlus
 
-    checkpoint_dir: checkpoints/diffusion
+    checkpoint_dir: checkpoints/diffusion/checkpoints_diffusion
 
-    print_progress_freq: 100
+    save_checkpoint_freq: 1250
 
-    validation_freq: 5000
+    validation_freq: 50
 
     validation_steps: 10
 
-    save_checkpoint_freq: 10000
+    print_progress_freq: 10
 
     save_n_recent_checkpoints: 5
 
+
 wandb:
 
-  mode: offline
+mode: offline
 
-  watch_model: false
+watch_model: false
 
-  results_dir: wandb
+results_dir: outputs
