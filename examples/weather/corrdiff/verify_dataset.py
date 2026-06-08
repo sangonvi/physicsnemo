@@ -10,7 +10,7 @@ CHECKPOINT = (
     "CorrDiffRegressionUNet.0.100000.mdlus"
 )
 
-DATASET_PATH = "zbsvpo23pn bew"
+DATASET_PATH = "/home/vsantos/rionowcast/datasets/corrdiff/train.zarr"
 #DATASET_PATH = "/home/sangonvi/Cefet/datasets/corrdiff/train.zarr"
 
 NORMALIZATION = "/home/vsantos/rionowcast/datasets/corrdiff/normalization.npz"
@@ -38,6 +38,7 @@ model = Module.from_checkpoint(
 model.cpu()
 model.eval()
 
+
 max_std = 0
 max_idx = 0
 
@@ -53,6 +54,7 @@ count_gt5 = 0
 
 target_std_sum = 0.0
 
+
 norm = np.load(NORMALIZATION)
 
 target_mean = float(norm["target_mean"][0])
@@ -65,7 +67,7 @@ for i in tqdm(range(len(dataset))):
     target = target.float()
 
     target = np.expm1(target)
-
+    
     values = target.flatten()
 
     n_pixels += values.numel()
