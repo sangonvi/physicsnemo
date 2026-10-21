@@ -6,10 +6,752 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.1.0a0] - 2026-XX-YY
+## [2.3.0] - 2026-XX-YY
 
 ### Added
 
+- Adds a Rotor37 compressor blade example with GeoTransolver
+  (`examples/cfd/rotor37_geotransolver`)
+- Adds an experimental, independently implemented SMART operator with sampled
+  geometry encoding, reusable latent contexts, and chunked field decoding.
+
+- Adds standalone FLARE++ attention and model APIs, with input-conditioned
+  dynamic routing, plus a ``GALE_FPP`` backend for using the same mixer inside
+  GeoTransolver.
+- Adds `physicsnemo.nn.functional.safe_normalize` for vector normalization
+  across floating-point dtypes and scales, preserving zero vectors and the
+  input dtype under autocast.
+- Adds `physicsnemo.datapipes.keys` and routes every config-driven field name
+  in `physicsnemo.datapipes` through it, so a `"."` in a YAML field name
+  (`"solution.pressure"`) addresses a leaf inside a nested `TensorDict`.
+  Nested `Mesh` data no longer needs to be flattened before use.
+- `DistributedManager.initialize(timeout=...)` accepts numeric seconds or a
+  `timedelta` for the default process-group timeout. Explicit values override
+  `PHYSICSNEMO_DIST_TIMEOUT_S`; unset or empty configuration keeps PyTorch's
+  backend default. Invalid timeouts are rejected before initialization state
+  changes, allowing corrected configuration to be retried.
+- `MeshToDomainMesh` in `cell_centroids` mode records each source cell's
+  complete effective measure on the interior under the mesh-owned
+  `_effective_measure` point-data key, so
+  integrals and weighted losses over the query points remain possible after
+  the cells are gone.
+- Unified external aero recipe: `NonDimensionalizeByMetadata` gains
+  `scale_geometry` so chained instances scale the geometry once; inference
+  re-dimensionalizes with the field maps of every instance.
+- Extends the diffusion module to support flow matching. The new API
+  surface covers three pieces:
+  - New losses in `physicsnemo.diffusion.metrics.losses` train against a
+    flow/velocity target: `FlowMatchingLoss`, plus `WeightedFlowMatchingLoss`
+    for an element-wise weight such as a binary mask. Their
+    `MultiDiffusionFlowMatchingLoss` and
+    `MultiDiffusionWeightedFlowMatchingLoss` counterparts provide patch-based
+    flow-matching training on large spatial domains. `MultiDiffusionModel2D`
+    and `MultiDiffusionPredictor` support both patch-based diffusion and flow
+    matching during training and inference.
+  - A dedicated `RectifiedFlowNoiseScheduler` in
+    `physicsnemo.diffusion.noise_schedulers` provides a rectified-flow
+    schedule.
+  - Module-wide support for flow predictors, enabled by new conversion
+    functions in `LinearGaussianNoiseScheduler` (`x0_to_flow` / `flow_to_x0`
+    / `score_to_flow` / `flow_to_score`) and the corresponding conversion
+    callbacks everywhere conversions between prediction types are necessary.
+- Adds `ExponentialEulerSolver`, `EDMStochasticExponentialEulerSolver`,
+  `DPMPlusPlus2M`, and `DPMPlusPlus2MUniC2` to
+  `physicsnemo.diffusion.samplers`. `ExponentialEulerSolver` supports
+  DDIM-like sampling for distilled few-step models, its stochastic
+  counterpart adds EDM-style churn and configurable re-noising,
+  `DPMPlusPlus2M` provides efficient second-order sampling, and
+  `DPMPlusPlus2MUniC2` adds a UniC-2 corrector stage that raises
+  DPM-Solver++(2M) to third order while keeping one denoiser evaluation
+  per step. The solvers share an extended semi-linear callback API
+  (`bias_fn`, `bias_int_fn`, `slope_fn`); users can select all four
+  solvers by string key through `physicsnemo.diffusion.samplers.sample`.
+
+- `ClusterTree.find_dual_interaction_pairs(source_admissible=...)` marks source
+  nodes that must never be approximated by their aggregate, such as nodes
+  whose normals differ too much.
+- `ClusterTree.find_point_interaction_pairs` builds a Barnes-Hut plan for
+  individual target points by a single-tree walk (every point reads nearby
+  sources exactly and distant nodes through their aggregates). For scattered
+  targets such as volume prediction points it replaces
+  `find_dual_interaction_pairs(expand_far_targets=True)`, whose criterion
+  charges the target leaf's own extent: on a 200k-face car with 200k volume
+  points the dual plan held 1.6e9 pairs at `theta=0.5` and the point plan
+  holds 1.5e8.
+- The PhysicsNeMo-Mesh API reference documents `physicsnemo.mesh.fields`
+  (`RankSpec` and `FieldSchema`) and the `physicsnemo.mesh.primitives` catalog.
+- `ClusterTree.merge` joins trees into one forest, whose `root_ids` list the
+  root of each tree. Every traversal starts from all of them, so one
+  traversal plans a tree against every tree of a forest, on either side.
+
+### Changed
+
+- `ClusterTree` builds tighter trees by default (`split="morton"`), so
+  Barnes-Hut plans need 2-4x fewer interactions at the same `theta`.
+  `split="midpoint"` gives the previous trees.
+- GLOBE's default `theta` is 1.5 (was 1.0). With the new trees, DrivAerML
+  training reaches about 40% lower validation loss in the same time.
+- GLOBE's default `expand_far_targets` is `True` (was `False`), as in its
+  examples.
+- `ClusterTree.compute_source_aggregates` is 20-30x faster, and
+  `ClusterTree.find_dual_interaction_pairs` is up to 1.7x faster with 40% less
+  peak memory. The plan's interactions are no longer sorted by source.
+- GLOBE's `BarnesHutKernel` needs less memory to train: an 80k-face DrivAerML
+  training step no longer runs out of memory.
+- An eager GLOBE training step on 10k-face DrivAerML samples runs 2.2x
+  faster, and `torch.compile` builds GLOBE faster, with the same outputs.
+- GLOBE's `BarnesHutKernel.forward` takes `near_chunk_count`, a number of
+  chunks, in place of `near_chunk_size`, and no longer takes
+  `source_aggregates`.
+- The `source_data` and `global_data` of GLOBE's kernel classes must hold
+  exactly the declared fields, under nested keys: a flat key such as
+  `"grp.v"` now raises a `KeyError` that names the wrong fields.
+- GLOBE returns nested output fields in sorted key order, such as
+  `("flow", "nut")` before `("flow", "u")`.
+- `ClusterTree.compute_source_aggregates` packs its source data with
+  `TensorDict.pack`, so source data with leaves of several dtypes now raises
+  a `TypeError` instead of being promoted.
+- Refresh core, optional, development, and container dependency versions.
+  Require PyTorch 2.13 or newer;
+  use PyTorch 2.13's CUDA 12.9 wheels for the CUDA 12 backend. NATTEN
+  extras select PyTorch 2.13 to match their prebuilt kernels. Python support remains
+  3.11 through 3.14.
+
+- Mesh connectivity sorts the vertices of its short index tuples (edges,
+  faces, cells) with a sorting network of elementwise minima and maxima on
+  large CUDA inputs, instead of `torch.sort`. On an NVIDIA GB300, facet and
+  boundary extraction, edge graphs, point adjacency, and manifold checks of
+  10M-cell meshes are 3-5x faster, butterfly subdivision 2.3x, and cell
+  adjacency, cleaning, and the DEC Laplacian 1.2-2.1x. Results are unchanged.
+- `physicsnemo.mesh.fields` is rebuilt around two types. `RankSpec` (`rank`,
+  `symmetric`, `parity`; `shape(n_spatial_dims)`, `numel(n_spatial_dims)`) is
+  one field's transformation law; `FieldSchema` is an insertion-ordered
+  mapping from dotted field names to `RankSpec`, parsed once at a model's
+  boundary with `FieldSchema.parse` (nested groups and dotted names flatten
+  alike) and queried with `.ranks`, `.count(rank)`, `FieldSchema.key(name)`,
+  and `.check(tensordict, label=...)`. Both are read-only `dict`s, so a
+  declaration serializes to JSON as written and model checkpoints can record
+  them directly. Validation is construction, so an invalid schema cannot
+  exist. A field is declared as a `RankSpec` or a mapping of values,
+  `{"rank": n}` (YAML: `pressure: {rank: 0}`); a mapping of mappings is a
+  nested group. Integer leaves are no longer accepted.
+- Mesh geometry, curvature, sampling, mesh generation, LSQ gradients, and
+  the PyTorch backends of the deformation functionals solve their small
+  per-cell determinants, inverses, and least-squares problems in closed form
+  instead of with batched `torch.linalg` calls. Vertex angles, Gaussian
+  curvature, and quality metrics become up to 1,000x faster on GPU, and many
+  mesh operations 4-130x faster on CPU.
+- Mesh vertex angles, dual volumes, curvature, quality metrics, and cell and
+  point normals use up to 3.4x less peak memory, and gradients through cell
+  centroids and normals are faster on GPU. Results are unchanged up to
+  rounding.
+- Mesh LSQ gradients (`Mesh.gradient`, `curl`, `divergence`,
+  `compute_point_derivatives`, `compute_cell_derivatives`, and the torch
+  backend of `physicsnemo.nn.functional.mesh_lsq_gradient`) solve the float32
+  systems of all points or cells at once rather than one neighbor count at a
+  time, and the derivatives of several fields share their least-squares
+  systems. On a GB200, the gradient of a 5.1M-tet mesh is 2.4x faster and
+  that of meshes up to 1.3M tets 3.4-3.7x faster; the derivatives of eight
+  scalar fields on a 1M-tet mesh are 13x faster. Results are unchanged up to
+  rounding. The intrinsic gradient of a float64 field on a float32 mesh now
+  returns a result of float32 accuracy instead of raising a dtype error.
+- GLOBE's field declarations are renamed after the schemas they hold:
+  `output_field_ranks`, `boundary_source_data_ranks` and `global_data_ranks`
+  become `output_schema`, `boundary_source_schemas` and `global_schema`
+  (kernels: `output_schema`, `source_schema`, `global_schema`), each also the
+  attribute holding the parsed `FieldSchema`. GLOBE raises
+  `NotImplementedError` for fields it does not implement (rank 2 and above,
+  pseudotensors) instead of silently dropping or misreading them. The GLOBE
+  examples and the unified external-aerodynamics recipe configs are updated.
+- Cell-to-cell adjacency pairs the cells of each shared facet in one
+  vectorized pass, adjacency offsets come from a binary search instead of
+  `bincount`, and adjacencies carry their device, so cached adjacencies are
+  reused without revalidation. Cell adjacency and the dual graph are 1.4-1.6x
+  faster with 30% less peak memory, and synchronize CUDA 5 times instead of 38.
+- Mesh adjacencies, facet extraction, manifold checks, and `fix_orientation`
+  use up to 3x less peak memory, with unchanged results.
+- `physicsnemo.mesh.Mesh`, `DomainMesh`, `Adjacency`, `BVH`, `ClusterTree`,
+  `DualInteractionPlan`, and `SourceAggregates` now inherit directly from
+  `TensorClass` instead of using the `@tensorclass` decorator. Existing
+  constructor defaults and `Mesh[m, s]` runtime specialization remain
+  available, and nested mesh types survive memmap round trips. The memmap
+  layout is unchanged: existing `.pmsh` and `.pdmsh` files remain readable, and
+  new files are byte-identical to those written with the decorator.
+- `from_pyvista(point_source="cell_centroids", manifold_dim=1)` builds the
+  dual graph of line, triangle, and tetrahedral meshes 25-30x faster, with
+  identical output. With the default `force_copy=False`, `to_pyvista` output
+  of 1D and 3D meshes now shares cell storage with the `Mesh`, as 2D output
+  already did.
+- Mesh facet extraction, repair, merging, smoothing, subdivision, and quality
+  metrics avoid CUDA synchronizations hidden in indexing with Python lists,
+  blocking copies of small host tables, boolean masks, and one `.item()` per
+  count. Laplacian smoothing synchronizes at most 4 times instead of about 30,
+  independent of the number of iterations, and `remove_degenerate_cells` is
+  about 5x faster. Results are unchanged.
+- Loop and butterfly subdivision evaluate their edge rules for every edge and
+  select with `torch.where`, instead of compacting boundary and interior edges
+  with boolean masks. Butterfly subdivision synchronizes CUDA 3 times instead
+  of 13, Loop subdivision 9 instead of 13, and both are 10-15% faster.
+- Mesh subdivision, `cell_data_to_point_data`, `point_data_to_cell_data`, and
+  `Mesh.merge` need up to 2.9x less peak memory, with unchanged results.
+- Mesh integration uses a shared `_effective_measure` field for complete cell
+  and point measures. Cell measures fall back to geometry; point measures are
+  explicit and independent of connectivity. `Mesh.integrate_samples` evaluates
+  point quadrature separately from existing cell and vertex-field integration.
+  Sampling, centroid conversion, geometric transformations, subdivision, and
+  GLOBE use the mesh-owned measure API. Point measures carry their represented
+  dimension so geometric scaling preserves their physical units.
+- Promotes the volumetric `DiffusionUNet3D` and its reusable `Conv3D`,
+  `GroupNorm3D`, `UNetAttention3D`, and `UNetBlock3D` layers from experimental
+  to stable production APIs in `physicsnemo.models.diffusion_unets` and
+  `physicsnemo.nn`. The promoted APIs now carry backward-compatibility
+  guarantees and output/checkpoint non-regression coverage. Existing
+  experimental import paths remain as deprecated compatibility shims.
+
+  **Migration from 2.2.x:** meshes saved with `cell_data["_measure_weights"]`
+  must be regenerated or converted once before integration:
+
+  ```python
+  from physicsnemo.mesh.calculus import set_cell_measures
+
+  if "_measure_weights" in mesh.cell_data:
+      weights = mesh.cell_data.pop("_measure_weights")
+      set_cell_measures(mesh, mesh.cell_areas * weights)
+  ```
+
+  Replace `compose_measure_weights` calls with `scale_measures`. Consumers
+  should read complete measures with `cell_measures` instead of multiplying
+  `cell_areas` by `cell_measure_weights`. Update stored-field mappings from
+  `cell_data._measure_weights` to `cell_data._effective_measure` and remove any
+  subsequent multiplication by geometric areas.
+
+- LSQ point gradients on large surface meshes are about 2x faster on GPU, and
+  LSQ gradients (`Mesh` and `physicsnemo.nn.functional.mesh_lsq_gradient`)
+  synchronize the GPU much less often. LSQ and DEC derivatives also need less
+  peak memory.
+
+- `Mesh.slice_points` picks its cell-remapping algorithm by mesh shape: the
+  full-mesh lookup table as before, or a binary search over the kept ids when the
+  mesh has far more points than cell-vertex entries (a reader keeping a block of
+  cells out of a mesh with hundreds of millions of vertices). Index
+  normalization avoids allocating a full-mesh range and preserves empty slices,
+  integer indices, and boolean masks. Point fields use ordinary indexed gathers.
+- Extends `LinearGaussianNoiseScheduler` with two methods.
+  `get_linear_denoiser` accepts `prediction_type` and `denoising_type`, and
+  returns bias, antiderivative, and slope callables for the new exponential
+  and multistep solvers. `snr` exposes the schedule's signal-to-noise ratio,
+  used as the multistep extrapolation coordinate by `DPMPlusPlus2M` and
+  `DPMPlusPlus2MUniC2`.
+
+- `translate`, `rotate`, `scale`, and their `DomainMesh` and datapipe
+  counterparts no longer synchronize CUDA for Python-number arguments, string
+  axes, rotations, and scalar scales, so they return without waiting for queued
+  GPU work. `transform` gains `assume_similarity` and `rotate` gains
+  `assume_valid_axis`, to skip the remaining runtime checks for general
+  matrices and device-tensor axes. Cached normals are mapped with one small
+  inverse instead of `solve_ex` with millions of right-hand sides, whose slow
+  path for pivoting matrices made `RandomRotateMesh(mode="uniform")` take 1.3 s
+  on the 17.7M-triangle DrivAerML surface (6.5 ms now, on a GB300).
+
+- The `tolerance` of `sample_data_at_points`, `find_containing_cells`, and
+  `find_all_containing_cells` is now relative. Barycentric coordinates must
+  still be `>= -tolerance`, but the distance from a point to a cell's affine
+  hull is now limited to `tolerance` times the largest absolute coordinate of
+  the mesh, instead of `tolerance` in mesh units. Results no longer depend on
+  the mesh's length unit and are identical when the mesh and query points are
+  scaled by a power of two.
+- Mesh BVH queries, and with them `validate`, `Mesh.clean()`, point
+  containment and sampling, use up to 2.7x less peak memory. Results are
+  unchanged.
+- `fix_orientation` orients cells of any dimension and is 6x faster on the
+  DrivAerML surface. Cells that fill their space, such as tetrahedra in 3D,
+  come out with positive volumes. Its stats add `n_cells_flipped`, with
+  `n_faces_flipped` kept as an alias, and `n_non_orientable_components`.
+- `repair_mesh(fix_orientation=True)` orients every mesh except point clouds,
+  instead of only surfaces in 3D.
+
+- `compute_mesh_statistics` reads all statistics in one device-to-host
+  transfer instead of about 20 `.item()` calls.
+- `MeshReader` and `DomainMeshReader` map sample files copy-on-write, so
+  editing a loaded sample in place no longer changes the dataset on disk.
+  Readers on Lustre also no longer take write locks.
+- Moving or copying a mesh with cached adjacencies no longer synchronizes a
+  CUDA device.
+- `BoundingBoxFilter` takes about half as long on CPU. On a GPU it
+  synchronizes once per coordinate key, instead of once per filtered tensor.
+- Every PhysicsNeMo-Mesh API page now opens with a figure, and the nine
+  tutorials in `examples/minimal/mesh` are reorganized from a first mesh to ML
+  pipelines. New sections show how to use the edge graph of a mesh, a
+  `Mesh[1, n]`, in graph network models.
+
+### Deprecated
+
+- Unified external aerodynamics recipe: `training.loss_type: rmse` is
+  deprecated in favour of `relative_mse`, which names what it always
+  computed (target-normalized relative MSE, no square root) and delegates
+  to `physicsnemo.metrics.general.relative_error`. `rmse` still works and
+  warns.
+
+### Removed
+
+- `physicsnemo.experimental.models.globe.utilities`, whose TensorDict helpers
+  GLOBE no longer uses.
+- `physicsnemo.mesh.fields`: `RankSpecDict`, `flatten_rank_spec`,
+  `rank_counts`, `ranks_from_tensordict`, and `validate_data_contains_ranks`,
+  replaced by `FieldSchema` (see Changed). Importing one of them from
+  `physicsnemo.mesh` or `physicsnemo.mesh.fields` raises an `ImportError` that
+  names its replacement.
+- Removes the opt-in `physicsnemo.compat` import-alias layer and the
+  `PHYSICSNEMO_ENABLE_COMPAT` environment variable. The layer mapped pre-v2.0
+  module paths onto their v2.0 locations; three minor releases later, callers
+  should import from the current paths listed in `v2.0-MIGRATION-GUIDE.md`.
+  Checkpoint loading is unaffected.
+- Removes `physicsnemo.utils.mesh`, deprecated since 2.1 with removal scheduled
+  for 2.2. The `vtk` and `stl` entries leave the `utils-extras` extra with it.
+  Replacements:
+  - `sdf_to_stl(field, threshold)`: `marching_cubes` from
+    `physicsnemo.mesh.generate` returns a `Mesh`; save it with `to_pyvista`
+    from `physicsnemo.mesh.io`, for example,
+    `to_pyvista(marching_cubes(torch.as_tensor(field), threshold)).save("out.stl")`.
+  - `combine_vtp_files(files, out)`:
+    `pyvista.merge([pyvista.read(f) for f in files]).save(out)`.
+  - `convert_tesselated_files_in_directory`: `pyvista.read(src).save(dst)` per
+    file; PyVista reads and writes OBJ, VTP, and STL.
+
+### Fixed
+
+- `GLOBE` accepts `boundary_meshes` as a TensorDict, as the DrivAerML example
+  passes them. Before, every forward pass of that example failed.
+- Under `torch.compile`, GLOBE no longer recompiles on its second training
+  step, nor for each new sample of a similar size. Each of these recompiles
+  took minutes at DrivAerML sizes.
+- The GLOBE examples' requirements no longer downgrade PyVista and Matplotlib
+  below the versions PhysicsNeMo requires.
+- `signed_distance_field`, in `physicsnemo.nn.functional` and
+  `physicsnemo.mesh.spatial`, supports backpropagation: the signed distance is
+  differentiable with respect to the mesh vertices and the query points.
+  Before, `backward` raised because the Warp op had no autograd formula. The
+  hit points and hit faces carry no gradients.
+- `Mesh.clean()`, `clean_mesh`, `merge_duplicate_points`, and `validate()` find
+  every duplicate point in clusters of more than 100 coincident points. Before,
+  some duplicates were missed and stayed in the cleaned mesh.
+- `fill_holes` works on meshes with point or cell data, where it raised before.
+  The new points and faces hold NaN in floating-point fields and 0 in others.
+- `compute_mesh_statistics` reports the mean and standard deviation of the
+  edge lengths of all cells. Before, the mean averaged each cell's shortest and
+  longest edge, and the standard deviation covered only the longest edges.
+- `is_manifold()` rejects triangle surfaces pinched at a vertex, such as two
+  closed surfaces that share a single vertex.
+- `get_boundary_edges` returns edges, not triangles, for meshes of four or more
+  manifold dimensions.
+- `Mesh.with_data` given a dict no longer shares nested data groups with the
+  source mesh, so changing the result leaves the source unchanged.
+- `cell_data_to_point_data` and `point_data_to_cell_data` raise, unless
+  `overwrite_keys=True`, when a field has the name of a data group in the
+  destination or the reverse. Before, they silently dropped data.
+- Cleaning or repairing a mesh with no cells keeps its point data fields, now
+  empty, so the result can be merged with other meshes.
+- `get_point_to_points_adjacency()` returns no neighbors for meshes of vertex
+  cells, where it raised before.
+- `Mesh` and `DomainMesh` subclasses that add fields no longer need their own
+  `__init__` with TensorDict 0.15, whose tensorclass subclasses inherit the
+  parent's `__init__`. The base `__init__` accepts and stores the fields that a
+  subclass declares, and still raises `TypeError` for any other keyword.
+- Linear subdivision of tetrahedral meshes keeps the orientation of every
+  child cell. Before, half of the children came out inverted.
+- Meshes with `int32` connectivity give the same results as `int64` ones in
+  Butterfly and Loop subdivision, edge lookups and `refit_mesh_to_implicit`.
+  Before, large meshes could get wrong Butterfly midpoints and edge matches,
+  Loop subdivision raised on open surfaces, and `refit_mesh_to_implicit` could
+  leave boundary vertices off the surface.
+- Loop subdivision of `float64` meshes computes its vertex weights in
+  `float64`. Before, it computed them in `float32`, which limited the new
+  vertex positions to `float32` precision.
+- A mesh saved with cached adjacencies now loads in a new Python process.
+  Before, `Mesh.load` raised unless `physicsnemo.mesh.neighbors` was already
+  imported.
+- Intrinsic cell gradients on curves in 3D now lie along each cell's own
+  direction. Before, they crashed on open curves and were projected onto the
+  wrong tangent on closed curves.
+- Curvature of a curve whose two edges at a vertex both start or both end
+  there, as `get_boundary_mesh` produces, is now correct. Before, the angle at
+  such a vertex was wrong, so a right-angled corner had zero curvature.
+- DEC gradients, divergences, and Laplacians of a float32 field on a float64
+  mesh now return float64 results instead of raising. DEC gradients and
+  Laplacians of tensor fields, and LSQ cell gradients, no longer fail on meshes
+  without cells, and `flat` handles fields with several trailing dimensions.
+- `DefaultCollator` with a `stack_dim` past the batch dimensions of the
+  samples stacks each tensor with `torch.stack`, without TensorDict behaviour
+  that 0.15 deprecates. The batch's `batch_size` now matches its tensors, and
+  samples with non-tensor data no longer fail to collate.
+- `physicsnemo.mesh` no longer raises small lengths, areas and volumes to a
+  fixed floor, which distorted results on float32 meshes in meters a few
+  millimeters across. Area-weighted aggregation, `partition_cells` centroids,
+  support volumes, the DEC Laplacian, the sharp, Gaussian, and mean curvatures,
+  and triangle circumcenters now give the same results at any scale.
+- `sample_random_points_on_cells` with a small `alpha` no longer places some
+  points outside their cells.
+- In float32, `sdf_polygon_2d` no longer gives NaN distances for a polygon
+  with a repeated vertex or NaN gradients on its edges, and
+  `mesh_implicit_domain` now meshes float32 polygons such as a square.
+- The API reference again shows the docstrings of `Mesh`, `DomainMesh`, and the
+  other tensorclasses in `physicsnemo.mesh`. TensorDict 0.14 replaced them
+  with generated signatures.
+- The GLOBE examples no longer pin TensorDict 0.12, which conflicted with
+  PhysicsNeMo's own requirement.
+- `delaunay_mesh_2d` recovers boundary segments that cross several triangles.
+  Before, it raised on simple polygons, even rectilinear ones, and blamed
+  float64 degeneracy or crossing segments.
+- `signed_distance_field` accepts non-contiguous query points and vertices,
+  such as a transposed tensor, which used to raise a Warp error.
+- The mesh `signed_distance_field` keeps the orientation of the near-degenerate
+  faces it repairs. Before, the repair could flip a thin face, so points
+  outside a watertight mesh got a negative distance.
+- `knn` with the cuML backend, `find_nearest_cells` and `match_points` return
+  empty results for an empty query set on CUDA, as they do on CPU, instead of
+  raising a CUDA error. `match_points` also returns no matches for an empty
+  target.
+- `DomainMeshReader` gains `boundary_subsample` (`"both"`, `"cells"`,
+  `"points"`) to choose which subsample applies to the in-file boundaries.
+  Composing the cell and point subsamples on a triangulated boundary kept only
+  the cells whose three vertices all survived the point cut, about `N / 27` of
+  the `N` requested. The default keeps the composed behavior.
+- Seeded `DomainMeshReader` subsamples select the same rows from Zarr stores
+  as from memmap files. Before, boundaries read in full, and interiors read
+  with `drop_interior_cells`, could differ between the two formats.
+- `from_pyvista(point_source="cell_centroids")` places the centroid of every
+  linear cell at the mean of its vertices, as `Mesh.cell_centroids` does.
+  Before, polygons, pyramids, prisms and polyhedra got other points, and even
+  a regular pentagon was off-center.
+- `to_pyvista` exports vertex-cell meshes, and empty line and triangle meshes,
+  with their cell data. Before, the export failed.
+- `to_zarr` raises a `TypeError` naming any field it cannot store, such as a
+  bfloat16 field, before it writes anything. Before, it left a partial store
+  that loaded without those fields.
+- `from_zarr`, `MeshReader` and `DomainMeshReader` raise on a zarr store that
+  `to_zarr` did not write or did not finish. Before, a store cut short by a
+  full disk, for example, loaded without its missing fields.
+- `from_zarr` loads scalar uint64 fields, where it raised before.
+- `Mesh.draw` with matplotlib colors 2D curves by their scalars and honors
+  `alpha_edges`. It also draws 1D meshes in view, vertex cells as colored
+  markers, and integer vector scalars, where it failed before.
+- `Mesh.draw` with PyVista lets `backend_options` set the edge color, line
+  width and scalar bar, where it raised before.
+- GLOBE DrivAerML postprocessing reports correct Cd, Cl, and Cs on subsampled
+  surfaces. Before, they shrank with the fraction of cells kept.
+- The unified external aero recipe documents how surface subsampling affects
+  force integration.
+- `ClusterTree.find_dual_interaction_pairs` returned an empty plan if any point
+  had a NaN coordinate, and failed on plans with more than 2^31 interactions.
+- `ClusterTree.from_points` no longer keeps the autograd graph of its inputs.
+- With `expand_far_targets=True` and `leaf_size > 1`,
+  `ClusterTree.find_dual_interaction_pairs` still approximated some targets by
+  their leaf's centroid.
+- Unified external aero recipe: the final epoch is always checkpointed,
+  resumed runs keep the epoch-mode learning-rate schedule (older checkpoints
+  resume one epoch behind), and fp16 runs save and restore `GradScaler` state.
+- Checkpoint loading resolves model weights at the selected training checkpoint's
+  filename index, preventing resumes that mix epochs. Missing required weights
+  raise before any model or training state is restored. Distributed loads validate
+  on every rank using rank 0's file lookup.
+- `fix_orientation` no longer leaves opposite windings across sharp creases,
+  such as the edges of a cube.
+- `Mesh.is_manifold()` no longer raises on a tetrahedral mesh with a
+  degenerate cell.
+- Mesh slicing reuses integer indices across connectivity, fields, and caches
+  to avoid repeated CUDA synchronization for the same boolean mask.
+  Point slicing skips mask processing when the output has no cells because
+  the input has no cells or the point selection is empty.
+- DEC gradients (`gradient(method="dec")`) of tetrahedral meshes read triangle
+  faces as edges and were wrong at most vertices, and on 1D meshes they raised.
+  They now use the edges of every cell and are exact for linear fields on
+  segments, triangles and tetrahedra. `to_edge_graph()` works on 1D meshes, and
+  `get_facet_mesh(manifold_codimension=0)` returns the deduplicated cells.
+- Meshes from `slice_cells` and `subdivide` get their own data containers, so
+  adding or removing a field on them no longer changes the source mesh.
+- Triangle areas use direct area components and a rescaled norm, preserving
+  thin faces and their quadrature measures without Gram cancellation or
+  overflow or underflow in the norm.
+- Vertex angles of nearly flat triangles in 2D and nearly flat tetrahedra are
+  now accurate. A 2D triangle with an angle near pi used to get angles of 0, 0,
+  and 0, which also threw off Gaussian curvature and quality metrics.
+- Gaussian curvature of curves in 3D is now correct: a unit circle with 1,000
+  segments had a curvature of 499 instead of 1.
+- Small angles from `stable_angle_between_vectors`, volumes of thin
+  tetrahedra in 4D or more, and FEM cotangent weights of thin cells keep their
+  accuracy in float32. The first two used to come out as 0.
+- FEM cotangent weights of long, thin but well-shaped cells are accurate in
+  any vertex order. A tetrahedron with one edge 5,000 times longer than the
+  others used to get the weights of a degenerate cell.
+- Vertex angles of triangles in 3D are correct in float16 and at any
+  coordinate scale, and `stable_angle_between_vectors` is correct in float16.
+  Both used to return NaN or wrong angles there.
+- On CUDA, LSQ gradients of rank-deficient stencils, such as those of a flat
+  surface, are now minimum-norm solutions, as on CPU. They used to be NaN,
+  wrong by orders of magnitude, or a `LinAlgError`.
+- On CUDA, `sample_data_at_points` next to a degenerate cell no longer raises
+  `LinAlgError`. Degenerate cells contain no sample points on any device, and
+  `compute_circumcenters` returns their centroid instead of NaN or infinity.
+- Edge flips in `mesh_implicit_domain` work at any coordinate scale; below
+  about 1e-13 they were silently skipped.
+- The PyTorch Sobolev deformation accepts float32 cells of any size, and the
+  StVK strain energy has finite gradients for degenerate reference cells.
+- Unified external aero recipe: near-wall SDF normals no longer flip inward
+  from float32 roundoff. Stored signed distances are unchanged.
+- Fixes mesh dtype handling: preserves integer-coordinate precision, normalizes
+  connectivity safely, and rejects integer `.to()` casts. Floating-point and
+  complex casts preserve the source mesh.
+- Fixed an issue in `Natten2DSelfAttention` and `RopeNatten2DSelfAttention`
+  with `qk_norm=True` mixing `LayerNorm` fp32 Q/K outputs with autocasted V
+  dtypes.
+- Normalizes cell, point, transformed, and partition-cluster mesh normals
+  robustly across floating-point dtypes and scales. Zero vectors remain zero,
+  small nonzero vectors retain unit length, and large finite vectors avoid
+  norm overflow.
+- Datapipe transforms, collators, readers, and the unified external aero
+  recipe no longer silently skip or mis-handle nested `TensorDict` fields
+  (membership was tested against top-level `td.keys()`, and
+  `NormalizeMeshFields.inverse_td` matched leaves by their last name only).
+- `from_pyvista` and `to_pyvista` round-trip nested `Mesh` data keys, and GLOBE
+  accepts a nested `global_data_ranks` declaration.
+- Fixes out-of-bounds reads in the `Darcy2D` multi-grid solver for
+  `nr_multigrids >= 3` that could return huge or NaN pressure fields, and
+  corrects the coarse-node coordinates used by bilinear upsampling for
+  reduction factors greater than 2.
+- `Module.save` now writes `.mdlus` checkpoints atomically (transfer to a
+  temporary sibling name, then rename into place), so a process killed
+  mid-write no longer leaves an unloadable truncated checkpoint. Also fixes
+  `legacy_format=True`, which failed with `FileNotFoundError` on current
+  fsspec versions.
+- `RandomRotateMesh` defaults to `mode="axis_aligned"` when `axes` is given.
+  Unified external aero recipe translation configs pass tensor bounds so
+  `torch.distributions.Uniform` instantiates.
+- `RenameMeshFields` and `DropMeshFields` also apply to a `DomainMesh`'s
+  domain-level `global_data`.
+- `sample_data_at_points` and `find_containing_cells` find on-surface points
+  of float32 surface meshes in large length units. A torus scaled to
+  `|x| ~ 1300` (millimeters) previously found 0.4% of its on-surface points
+  and returned NaN for the rest, because float32 rounding (about
+  `1.2e-7 * |x|`) exceeded the absolute `1e-6` distance tolerance.
+- `BVH.from_mesh` and `ClusterTree.from_points` compute Morton codes for 1-3
+  spatial dimensions by spreading each coordinate's bits with a few
+  shift-and-mask steps. CUDA no longer materializes every bit as int64 (about
+  1 kB per point, 55 GB at 50M cells); temporaries are about 72 B per point in
+  3D, and the step is about 4x faster on large inputs. Codes are unchanged.
+- `sample_data_at_points`, `find_containing_cells`, and
+  `find_all_containing_cells` no longer miss the containing cell when a query
+  point has more than 32 BVH candidate cells (for example, near a vertex shared
+  by many triangles, or with a prebuilt BVH with `leaf_size > 1`). The BVH
+  candidate search used by these functions no longer caps candidates per point.
+- Fixes `VPNoiseScheduler.sigma_inv` at extreme noise levels. In particular,
+  converting `sigma=0` no longer returns a slightly negative diffusion time.
+- `radius_search` with `implementation="torch"` no longer returns point 0's
+  coordinates in unused neighbor slots when `max_points` exceeds the number of
+  points. Those slots now stay zero, as with the warp backend, so point 0 no
+  longer receives their gradient.
+- Eleven PhysicsNeMo-Mesh API pages that listed no functions now document them,
+  and the pages of tensorclasses such as `Mesh` no longer list every TensorDict
+  method.
+- PhysicsNeMo-Mesh examples that raised an error, and claims that the code
+  contradicts, are corrected across the API reference, READMEs, and docstrings.
+  The corrected claims include the sign of the Laplacian and the dimensions
+  that each calculus operator supports.
+- The transient conjugate heat transfer tank filling example trains again, on
+  one GPU or several. Before, its `train.py` stopped with a `TypeError` before
+  the first step.
+
+### Security
+
+### Dependencies
+
+- Requires TensorDict 0.15 (`tensordict[zarr]>=0.15.0,<0.16.0`). Building,
+  copying, and moving small meshes takes 20-50% less time on CPU.
+- Drops `onnx`, `torchvision` and `pandas` from the required dependencies.
+  `pandas` is now optional via `datapipes-extras` or `model-extras`.
+
+## [2.2.1] - 2026-XX-YY
+
+### Fixed
+
+- Allows installation on all Python 3.14 patch releases while continuing to
+  exclude Python 3.15 and later.
+- Pins install CI to the interpreter provisioned by `setup-python` and verifies
+  the runtime version, preventing `uv` from silently selecting another Python.
+- Keeps tensorclass mesh API annotations introspectable under Python 3.14's
+  deferred annotation evaluation.
+
+## [2.2.0] - 2026-08-27
+
+### Added
+
+- Adds `ShardTensor` support for GeoTransolver and FLARE models.
+- Adds zarr save/load for `Mesh` and `DomainMesh` via tensordict's zarr
+  storage backend: `physicsnemo.mesh.io.to_zarr` / `from_zarr`, with
+  training-appropriate chunking and zstd compression. `MeshReader` and
+  `DomainMeshReader` transparently read zarr stores alongside
+  `.pmsh`/`.pdmsh` (opt in via `pattern`). Requires optional `zarr >= 3`
+  and a tensordict release with the zarr backend.
+- Adds configurable activation checkpointing to Transolver, FLARE, and
+  GeoTransolver. Transolver and FLARE support interleaved block checkpointing;
+  GeoTransolver supports checkpointing context construction, per-stream input
+  projections, GALE or GALE_FA blocks, and output projections.
+- Promotes GeoTransolver out of `experimental` to
+  `physicsnemo.models.geotransolver.GeoTransolver`, together with the FLARE
+  model (`physicsnemo.models.flare.FLARE`) and the reusable GALE and FLARE
+  attention layers (`physicsnemo.nn.GALE`, `physicsnemo.nn.GALEBlock`,
+  `physicsnemo.nn.FLARE`). The embedded OOD guard is decoupled from the model.
+  Wrap a constructed GeoTransolver with
+  `physicsnemo.experimental.guardrails.embedded.GuardedGeoTransolver` (or
+  `attach_ood_guard`) to enable out-of-distribution guarding. PhysicsNeMo removes
+  the  `guard_config` model argument. Legacy import shims keep the pre-move
+  `physicsnemo.experimental` import paths working and emit a
+  `LegacyFeatureWarning` pointing to the new locations.
+- Adds `zenith_azimuth_angles` and `zenith_azimuth_angles_from_timestamp` to
+  `physicsnemo.utils.zenith_angle`, returning
+  `(sin_zenith, cos_zenith, sin_azimuth, cos_azimuth)` alongside the existing
+  `cos_zenith_angle` / `cos_zenith_angle_from_timestamp` helpers. The azimuth
+  follows the north-clockwise convention.
+- Adds `physicsnemo.nn.shrink_and_perturb_`, an in-place shrink-and-perturb
+  weight re-initialization for warm-starting from pretrained weights.
+- Adds dimension-generic volume mesh generation for implicit domains to
+  `physicsnemo.mesh.generate`. `mesh_implicit_domain` meshes
+  `{x : phi(x) < 0}`, clipped to the bounding box (box faces are honored
+  as a boundary, so that external-flow "box minus obstacle" domains work
+  directly), for any implicit function (signed-distance functions, level
+  sets, or neural fields).
+- Adds compile-safe subclassing extension points to `domain_parallel.ShardTensor`
+  (`_extra_inner_tensors`, `__subclass_flatten_context__` / `__subclass_unflatten__`,
+  `_stable_inner_sentinel`, and a DTensor-style `__metadata_guard__`), so a subclass can
+  carry extra inner tensors and opaque metadata through `torch.compile` without
+  re-implementing the flatten protocol. Base behavior unchanged.
+- Adds `ShardTensor._subclass_propagated_attrs`: attribute names base `__torch_function__`
+  copies from an op input onto its eager op-result, re-classing it to the subclass. Skipped
+  under compile; empty by default.
+- Adds `install_aot_plain_tangent_coercion` (run on import): rebuilds a plain backward
+  cotangent into a `ShardTensor` when a boundary crosses a Dynamo graph break, instead of
+  AOTAutograd raising "guessed its metadata incorrectly". `__coerce_same_metadata_as_tangent__`
+  now also coerces down to a plain tensor at a replicated boundary.
+- Adds `domain_parallel.shard_utils.halo_scatter`: a `torch.compile`-safe halo
+  scatter-correction primitive for `Shard(0)` ShardTensors with a borrowed-ghost overlay.
+  `halo_scatter_correct` fuses the fold-to-owner / refresh-ghost exchanges into a self-adjoint
+  `custom_op` (correct forward and backward under `aot_eager` and inductor), with routing
+  passed as a packed graph-input tensor so it survives graph breaks;
+  `register_halo_scatter_handlers` wires it onto `scatter_add` / `index_add`. The row
+  transport is a pluggable backend (`select_halo_backend`, `PHYSICSNEMO_HALO_BACKEND`):
+  a portable `funcol` path and an intra-node symmetric-memory (CUDA-IPC) path.
+- Extends `halo_scatter` with `pack_halo_routing(cap=)` fixed-shape routing (for compiled
+  `dynamic=False` runs), an in-place `scatter_add_` / `index_add_` dispatch handler, and
+  node-locality routing in `select_halo_backend` (single-node uses symm-mem, multi-node
+  falls back to `funcol`).
+- Adds a `ShardTensor.grad_dtype` property override (returns the local tensor's dtype)
+  so a newer-PyTorch `grad_dtype` read during Dynamo fake conversion doesn't fall back
+  to a non-leaf DTensor and break compile. Mirrors the `grad_fn` / `is_leaf` / `grad`
+  shields.
+- Adds `integrate_moment` and `Mesh.integrate_moment` for measure-weighted
+  outer-product moments. Mesh integration APIs now accept `nan_policy`.
+- Adds per-cell measure weights that are preserved through cell subsampling
+  and consumed by mesh integration routines and GLOBE.
+- Adds a `global_shape` argument to `ShardTensor.from_local`, enabling the
+  no-communication `sharding_shapes="chunk"` path.
+- Adds exact-boundary quality mesh generation to
+  `physicsnemo.mesh.tessellation`: `fill_interior` takes a closed
+  codimension-one boundary `Mesh` (2D edge loops today; loops in any order
+  and orientation, with holes, multiple components, and nested islands
+  resolved automatically) and fills the interior with quality simplices via
+  constrained Delaunay triangulation with Ruppert refinement — every input
+  vertex is preserved bit-identically, every output triangle meets the
+  guaranteed minimum-angle bound, output is a `Mesh` with provenance
+  `point_data`, deterministic, with optional bound-preserving ODT smoothing.
+  The contract is dimension-generic; `n = 3` raises `NotImplementedError`
+  pending exact boundary recovery. Also adds `polygon_interior_point`,
+  which returns a point strictly inside a simple polygon.
+- Adds `rectilinear_grid_divergence`, `rectilinear_grid_curl`, and
+  `rectilinear_grid_laplacian` to `physicsnemo.nn.functional`, with Torch and
+  fused Warp implementations for periodic, nonuniform rectilinear grids.
+- Adds triangle-surface remeshing with NVIDIA Warp on CPU and CUDA, including
+  `remesh`, `Mesh.remesh`, topology cleanup, barycentric point-data transfer,
+  direct or attached linear-resolution-field control, and advanced tensor-level
+  tuning.
+- Adds coverage reporting on PRs — an informational `Coverage %` check plus a
+  ready-to-enable Codecov integration.
+- Adds differentiable mesh morphing: Torch-backed dense ``displace_points`` /
+  ``Mesh.displace`` and Torch/NVIDIA Warp compact sparse-control
+  ``morph_points`` / ``Mesh.morph`` / ``DomainMesh.morph``.
+- Adds differentiable Sobolev mesh deformation through
+  `sobolev_deform_points` and `Mesh.sobolev_deform`. A matrix-free,
+  uniform-mass P1 Helmholtz solve smooths dense per-vertex displacements and
+  their adjoints, with optional fixed-point constraints. Torch and CUDA Warp
+  backends provide explicit implicit-adjoint differentiation.
+- Adds thin-plate-spline radial-basis deformation through
+  `radial_basis_function_deform_points`,
+  `Mesh.radial_basis_function_deform`, and
+  `DomainMesh.radial_basis_function_deform`. PyTorch performs the differentiable
+  coefficient solve. Torch and fused NVIDIA Warp backends evaluate the field.
+- Adds differentiable lattice free-form deformation with Torch and NVIDIA Warp
+  backends: dimension-generic ``free_form_deform_points`` /
+  ``Mesh.free_form_deform`` / ``DomainMesh.free_form_deform`` with Bernstein
+  (classic FFD) and locally supported uniform cubic B-spline bases, plus
+  node-interpolating `linear`, `cubic_hermite`, and `quintic_hermite` modes.
+- Adds fixed-topology ``simplex_strain_energy``, ``simplex_measure_energy``,
+  ``total_measure_energy``, ``simplex_inversion_energy``,
+  ``closed_surface_volume_energy``, and ``surface_bending_energy`` to
+  ``physicsnemo.nn.functional``, with mesh-aware wrappers in
+  ``physicsnemo.mesh.deformation``. Torch supports higher-order derivatives,
+  and Warp provides first-order GPU kernels.
+- Adds differentiable nearest-surface shrinkwrap through
+  `shrinkwrap_points` and `Mesh.shrinkwrap`. Torch provides the reference
+  search, NVIDIA Warp accelerates ``float32`` nearest-face queries on CPU and
+  CUDA. Both backends replay the selected projection with PyTorch autograd.
+  Triangulated examples demonstrate weighted panel conformance and partial
+  design-region projection onto a shape-optimization constraint.
+- Adds `uniform_grid_divergence`, `uniform_grid_curl`, and
+  `uniform_grid_laplacian` to `physicsnemo.nn.functional`, with Torch and fused
+  Warp implementations for periodic Cartesian grids.
+- Adds the experimental Strata weather-emulation models —
+  `physicsnemo.experimental.models.strata.Strata` and `StrataTransformer3D` — plus
+  the continuous / stereographic RoPE helpers `build_rope_cos_sin_1d_continuous`,
+  `build_axial_rope_cos_sin_2d_continuous`, `stereographic_projection`, and
+  `spherical_centroid` in `physicsnemo.experimental.nn`.
+- Adds Point-Transformer local vector-attention blocks to `physicsnemo.nn`.
+- Adds an `is_causal` option to `TimmSelfAttention` in `physicsnemo.nn` for
+  causal self-attention.
+- FSDP2 checkpoint support: full save/load round-trip for
+  ``torch.distributed.fsdp`` v2 models, including DTensor edge cases,
+  cross-mesh reloads, and optimizer state loading.
+- Migrated the StormCast example from DDP + Domain Parallel  to FSDP2 +
+  Domain Parallel. StormCast previously used ``FullyShardedDataParallel``
+  with ``ShardingStrategy.NO_SHARD`` (equivalent to DDP) alongside domain
+  parallelism; it now uses the FSDP2 ``fully_shard`` API, producing 2D-mesh
+  DTensor parameters when ``use_shard_tensor`` is enabled.
+- Adds tensor-returning `Mesh.gradient`, `Mesh.divergence`, `Mesh.curl`, and
+  `Mesh.laplacian` convenience methods to `physicsnemo.mesh`, mirroring
+  `Mesh.integrate` (each returns a tensor and accepts a data key or a raw
+  tensor, with a `data_source="points"|"cells"` kwarg selecting vertex or
+  cell-centered fields). This gives the discrete differential operators a
+  consistent, discoverable surface on `Mesh`; previously divergence/curl/
+  laplacian were reachable only as free functions in `physicsnemo.mesh.calculus`.
+  Adds `compute_divergence_cells_lsq` and `compute_curl_cells_lsq` free
+  functions (cell-centered LSQ analogues); DEC operators and the cotangent
+  Laplacian remain vertex-only and raise `NotImplementedError` for cell data.
+- Adds `farthest_point_sampling` to `physicsnemo.nn.functional`, a greedy
+  farthest-point sampling (FPS) functional for point clouds.
+- Adds `FourierPositionalEmbedding` to `physicsnemo.nn`, a deterministic
+  axis-wise (NeRF-style) Fourier positional embedding for continuous
+  coordinates with no learnable parameters.
+- Adds radiation transport example (`examples/nuclear_engineering/radiation_transport`)
+- Adds agent skills structure, and initial skill for 'discoverability'.
+- Adds the experimental AeroJEPA model
+  (`physicsnemo.experimental.models.aerojepa.AeroJEPA`), a joint-embedding
+  predictive architecture for 3D aerodynamic fields composing context and
+  target encoders, a query-token field decoder, and a JEPA predictor head,
+  together with its SIGReg, token-latent, and reconstruction loss family.
+  The generic point-cloud tokenizer and the batch/mask/k-NN helpers are added
+  under `physicsnemo.experimental.nn`; the local point-transformer attention
+  blocks it composes come from `physicsnemo.nn`.
+- Adds the AeroJEPA SuperWing tutorial recipe
+  (`examples/cfd/external_aerodynamics/aerojepa`), an end-to-end Hydra-driven
+  workflow covering dataset download, normalization, JEPA training, chunked
+  inference, field-error plots, and CL/CD post-processing.
 - Adds xDeepONet to experimental models
   (`physicsnemo.experimental.models.xdeeponet.DeepONet`).  A single
   dimension-generic (2D/3D) DeepONet that accepts a spatial or MLP branch,
@@ -19,8 +761,461 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Supports multi-channel output, multiple decoder types (MLP, Conv,
   temporal projection), composable Fourier / UNet / Conv spatial branches
   (`SpatialBranch`), and coordinate features.
+- Adds `FNO4DWrapper` to the xdeeponet package: a thin wrapper around the
+  library `physicsnemo.models.fno.FNO` (`dimension=4`) that adds
+  autoregressive time-axis extension over `(B, X, Y, Z, T, C)` inputs (predict
+  a `K`-step forecast horizon via `target_times`).  Use
+  `physicsnemo.models.fno.FNO(dimension=4)` directly when the time-axis
+  extension is not needed.  3D FNO / Conv-FNO / U-FNO operators are expressed
+  as `DeepONet(trunk=None, dimension=3)` with a Fourier/UNet/Conv
+  `SpatialBranch`.
 - Adds `Sin` elementwise sine activation to `physicsnemo.nn`, registered
   in `ACT2FN` so it can be looked up by name (`get_activation("sin")`).
+- Adds active-learning recipe for external-aerodynamics surrogates
+  (`examples/cfd/external_aerodynamics/active_learning_aero/`). Iteratively
+  fine-tunes a GP-augmented GeoTransolver onto an out-of-distribution
+  target class by scoring unlabeled candidates with a joint UQ signal
+  (GP-vs-integrated-drag disagreement + GP posterior std) and selecting
+  the top-`k` per round. Built on the `physicsnemo.active_learning`
+  protocols and `physicsnemo.experimental.uq.VariationalGPHead`, with a
+  layered structure (generic AL driver / GP-UQ recipe / aero adapter)
+  designed for reuse on other UQ-based regression problems.
+- Adds `FieldVariationalGPHead` to `physicsnemo.experimental.uq`, a pointwise
+  independent multitask variational GP head for per-point, multi-channel *field*
+  uncertainty. It is the field sibling of `VariationalGPHead` (which pools a
+  geometry to one embedding and predicts a scalar): it keeps the point dimension
+  and returns one Gaussian posterior per point per channel, so a single forward
+  pass yields the field prediction, the total predictive variance and the
+  epistemic-only variance — no ensembling or MC-Dropout. Backbone-agnostic (it
+  consumes only a `(..., input_dim)` feature tensor), with an optional DKL MLP,
+  a Matérn ARD kernel (5/2 by default), float64 GP internals, an `l2_radial` feature
+  normalization that preserves the radial out-of-distribution cue, and an
+  optional heteroscedastic observation-noise MLP. Includes a surface field-GP
+  training recipe for GeoTransolver
+  (`examples/cfd/external_aerodynamics/transformer_models/src/train_field_gp.py`).
+- Adds a `return_point_features` forward flag to
+  `physicsnemo.models.geotransolver.GeoTransolver`, which additionally returns
+  the per-point latents computed just before the output projection. These are
+  the features a pointwise head such as `FieldVariationalGPHead` consumes.
+- Adds `LatentNoveltyQueryStrategy` to the active-learning aero recipe,
+  a third acquisition strategy that ranks unlabeled samples by their
+  average kNN cosine distance in the encoder's learned geometry latent
+  — reusing the same `OODGuard`
+  (`physicsnemo.experimental.guardrails.embedded`) that flags
+  out-of-distribution inputs at inference time. The guard is calibrated
+  on the currently labeled set each round; round 1 falls back to
+  class-balanced random because the calibration buffer is empty. New
+  public `OODGuard.score_geometry()` method exposes the raw per-sample
+  geometry-latent kNN distance as a continuous score for downstream
+  consumers (e.g. AL acquisition) without the boolean thresholding /
+  warning emission of `OODGuard.check()`.
+- Adds rotary position embedding (RoPE) modules to `phyiscsnemo.nn` and
+  integrates support for 2D RoPE in the neighborhood attention backend
+  of `DiT` layers.
+- Adds support for RoPE, dynamic invalid-region masking, and a new
+  `ConvDetokenizer` in `phyiscsnemo.models.DiT`. Invalid regions are supplied
+  per forward call via the `invalid_mask` argument of `DiT.forward` (a
+  per-sample, batch-variable pixel mask, domain-parallel safe), replacing
+  flagged tokens with a learned mask token.
+- Adds an inference script (`src/infer.py` + `conf/infer.yaml`) to the
+  Unified External Aero Recipe
+  (`examples/cfd/external_aerodynamics/unified_external_aero_recipe`),
+  with integrated aerodynamic force/moment coefficients (`src/forces.py`:
+  CD/CL/CS/CMR/CMP/CMY). The script is model/dataset-agnostic, writes one
+  native `.pdmsh` `DomainMesh` per sample (carrying physical-unit
+  `pred_<field>` / `true_<field>`), reports training-space metrics
+  (matching the training/validation loop), and reuses the trainer's
+  dataloader / collate / metric tooling (refactored into `datasets.py`
+  and `utils.py`).
+- Adds `physicsnemo.mesh.spatial.signed_distance_field`, a `Mesh`-typed
+  wrapper over the Warp-backed `physicsnemo.nn.functional.signed_distance_field`
+  op (CPU and CUDA), returning `(sdf, hit_points, hit_faces)` per query. The
+  sign comes from Warp's angle-weighted pseudo-normal (robust at
+  sharp/non-convex edges) or, with `use_sign_winding_number=True`, its
+  generalized winding number (robust on non-watertight meshes).
+  (Near-)degenerate faces, which the Warp mesh query would otherwise skip,
+  are repaired into equivalent thin-but-valid triangles before the query.
+  Supersedes and removes the private datapipes implementation
+  (`physicsnemo.datapipes.transforms._sdf_torch` / `_sdf_triton`); the public
+  datapipes SDF transform delegates here.
+- Added an iterable style dataset to physicsnemo datapipes, for on-the-fly gpu simulations.
+- DPS guidance now supports **non-uniform guidance strength**: the `std_y` and
+  `gamma` arguments of `physicsnemo.diffusion.guidance.ModelConsistencyDPSGuidance`
+  / `DataConsistencyDPSGuidance` and their
+  `physicsnemo.diffusion.multi_diffusion` counterparts accept tensors as well as
+  floats. A tensor assigns a different measurement-noise level / SDA scaling to
+  each observation component, e.g. per-channel (`(1, C, 1, 1)`) or pointwise
+  (full observation shape). Passing floats keeps the previous uniform
+  behavior unchanged.
+- Adds `relative_mse` and `relative_l2` (target-normalized regression errors,
+  `relative_l2 = sqrt(relative_mse)`) to `physicsnemo.metrics.general`
+  (`relative_error.py`), with optional element `weights` and `dim`-based
+  reduction matching `general.mse`.
+- `physicsnemo.metrics.general.mse` `mse`/`rmse` gain an optional `weights`
+  argument for a masked/weighted mean (backward-compatible; `weights=None`
+  reproduces the prior unweighted result).
+- Adds a kinetic Monte Carlo (KMC) surrogate example
+  (`examples/kinetic_monte_carlo`): a probabilistic autoregressive surrogate
+  (`ParticleGeoTransolver`) that emulates a KMC event stream, predicting the
+  next event (the new particle's features and inter-event delay) from the
+  current particle population, an optional background mesh, and the simulation
+  time. Independent rollouts form an ensemble for uncertainty quantification.
+- Adds an FP-DDM domain-decomposition example (`examples/tcad/fp_ddm`): an
+  overlapping Schwarz method for steady 2-D thermal problems with a
+  physics-informed PhysicsNeMo FNO local solver, a matrix-free finite-volume
+  reference solver, and a numerical plane-stress elasticity baseline.
+
+### Changed
+
+- Splits the monolithic `physicsnemo.diffusion.noise_schedulers.noise_schedulers`
+  and `physicsnemo.diffusion.samplers.solvers` modules into one module per class,
+  named after the schedule or solver it defines, with the `NoiseScheduler` and
+  `Solver` protocols in a `base.py` of their respective sub-package.
+  Implementations are unchanged and every class is still re-exported from
+  `physicsnemo.diffusion.noise_schedulers` and `physicsnemo.diffusion.samplers`,
+  so the public import paths stay the same. The two old module paths remain as
+  deprecated shims that re-export the same classes and raise a
+  `DeprecationWarning` on import, so existing code keeps working. Import from
+  `physicsnemo.diffusion.noise_schedulers` and `physicsnemo.diffusion.samplers`
+  instead.
+- `physicsnemo.nn.functional.signed_distance_field` now returns a 3-tuple
+  `(sdf, hit_points, hit_faces)` — `hit_faces` is the int64 index of the
+  triangle holding each closest point. Queries with no triangle within
+  `max_dist` now return `NaN` distance/hit point and a `-1` face index
+  (previously the out-of-band results were undefined: the kernel read from
+  an uninitialized face index). Mesh-index range validation on CUDA inputs is
+  now a device-side assert instead of a host-synchronizing check, so the op
+  is safe on a sync-free prefetch stream; the eager `ValueError` is kept on
+  CPU.
+- Optimizes the production container build by consolidating related filesystem
+  operations, using BuildKit bind and cache mounts, and separating custom,
+  declared, and project dependency installation. Reduces total physicsnemo layers
+  by around 78%.
+- `GeoTransolver.forward`'s `return_embedding_states` and `return_point_features`
+  are now keyword-only. They share a return signature, so a positional `True` did
+  not say which was meant. Callers already passing them by keyword are unaffected.
+- `ShardTensor.redistribute` now computes receive shapes analytically when
+  sharding shapes are known, skipping the shape-negotiation `all_to_all`
+  collective (falls back to the collective only when shapes are unavailable).
+- PhysicsNeMo-Mesh tensor-valued gradients now consistently use the documented
+  derivative-first layout `(entity, spatial_dimension, *value_shape)` across
+  LSQ, intrinsic LSQ, and DEC. Earlier LSQ releases returned
+  `(entity, *value_shape, spatial_dimension)` instead; migrate a stored legacy
+  gradient with `legacy_gradient.movedim(-1, 1)`. Divergence and curl values
+  are unchanged.
+- xDeepONet `SpatialBranch`
+  (`physicsnemo.experimental.models.xdeeponet.SpatialBranch`) now supports
+  mixed-precision (AMP/autocast) training: FFT-based spectral convolutions are
+  evaluated in float32 internally (cuFFT lacks complex-half support) while the
+  rest of the branch uses autocast. This is a no-op under full precision, so
+  fp32 outputs are unchanged. Also fixes a stale module docstring that
+  referenced removed trunk/MLP-branch builder helpers.
+- `physicsnemo.mesh.remeshing.remesh` now raises `NotImplementedError` for
+  non-2D-in-3D inputs (the remeshing implementation is surface-only) instead
+  of failing confusingly downstream, and its docstring reflects that
+  restriction.
+- `physicsnemo.mesh.spatial`: `BVH.from_mesh` and `ClusterTree.from_points` now
+  share a single morton-LBVH node-topology builder (`spatial/_lbvh.py`),
+  removing ~80 lines of duplicated build logic; construction output is
+  byte-identical. `BVH.from_mesh` now defaults to `leaf_size=1` (was 8),
+  matching `ClusterTree.from_points` and measured to be more performant across
+  platforms (smaller leaves yield fewer candidate cells per query). Containment /
+  nearest-cell query results are unchanged. Adds the first direct unit tests for
+  `ClusterTree` (construction invariants, aggregates, dual-tree cover).
+- `physicsnemo.mesh` performance: eliminated host-device syncs on hot paths.
+  Cached topological adjacencies now store the `Adjacency` object directly instead
+  of reconstructing it (which re-ran its syncing `__post_init__` validation) on every
+  lookup — making cached adjacency lookups ~120x faster on GPU (~335us → ~3us for a
+  10k-point sphere); the BVH leaf-hit expansion drops two per-traversal-level syncs;
+  and the Laplacian smoother reuses its per-iteration buffers in place instead of
+  reallocating them.
+- `physicsnemo.mesh.Mesh.slice_cells` now accepts `None`/`Ellipsis` (keep all
+  cells, return self), matching its type hint and `slice_points`;
+  `gaussian_curvature_cells` reuses the cached `gaussian_curvature_vertices`
+  property instead of recomputing it.
+- `physicsnemo.mesh.Mesh` convenience methods now directly reuse shared
+  canonical functions, removing duplicate implementation bodies and docstrings.
+  This includes geometric, deformation (including radial-basis-function
+  deformation), calculus, topology, visualization, and validation operations.
+- `physicsnemo.mesh`: `draw` and `validate` are now the canonical standalone
+  names matching `Mesh.draw` and `Mesh.validate`. The `draw_mesh` and
+  `validate_mesh` remain as pending-deprecation compatibility names.
+  `Mesh.validate` and `DomainMesh.validate` share the canonical validation
+  option order, preserve the historical positional `tolerance` argument, and
+  expose the new `check_self_intersection` option as keyword-only.
+- `physicsnemo.mesh`: `validate(check_self_intersection=True)` now raises
+  `NotImplementedError` (the check is unimplemented) instead of silently returning a
+  `None` sentinel that masquerades as "no self-intersections found".
+- `Mesh.strip_caches` and `DomainMesh.strip_caches` now accept a `keep`
+  argument for retaining selected cache entries while clearing the rest.
+  `Mesh.with_points` and `Mesh.with_cells` provide cache-aware coordinate and
+  connectivity replacement for operations that preserve point or cell indexing,
+  while data-only mesh transforms now preserve valid geometry and topology caches
+  through `Mesh.with_data`.
+- `physicsnemo.mesh` quality metrics now use a normalized
+  aspect ratio of longest edge to minimum altitude. The metric is dimensionless and
+  scale-invariant for simplices of every manifold dimension, and a regular
+  simplex now has `aspect_ratio=1` and `quality_score=1`. This intentionally
+  corrects the previous erroneous aspect-ratio and quality-score values.
+- `Mesh.quality_metrics` and `Mesh.statistics` again use explicit property
+  getters so their class-facing documentation describes argument-free property
+  access. Configurable statistics tolerance remains available through the
+  standalone `compute_mesh_statistics` function.
+- Performance improvements in the diffusion module: reduced peak memory of
+  DPS-guided diffusion sampling most notably for multi-diffusion at large
+  domains. A guided `sample()` loop run under `torch.no_grad()` now detaches the
+  state between solver steps, so the guidance autograd graph is no longer
+  accumulated across the sampling trajectory (sampled outputs are unchanged;
+  use `torch.no_grad()`, not `torch.inference_mode()`). Also expands CI test
+  coverage and adds an API documentation page for
+  `physicsnemo.diffusion.multi_diffusion`.
+- Performance improvements in IO prefetching and GPU preprocessing in physicsnemo datapipes.
+- &#9888;&#65039; **BC-impact (DPS guidance):** a custom `norm` callback passed to
+  `physicsnemo.diffusion.guidance.ModelConsistencyDPSGuidance` /
+  `DataConsistencyDPSGuidance` (and their `physicsnemo.diffusion.multi_diffusion`
+  counterparts) must now return an **elementwise** loss (same shape as its
+  inputs) instead of a per-batch-element reduced scalar of shape `(B,)`.
+  Migration: drop the reduction from your `norm`, e.g. return
+  `(y_pred - y_true).abs().pow(2)` rather than
+  `(y_pred - y_true).pow(2).reshape(B, -1).sum(dim=1)`. For
+  `DataConsistencyDPSGuidance` (and its `multi_diffusion` counterpart) the
+  `norm` callback now also receives the **unmasked** `(x_0, y)` and the mask is
+  applied to its output (`mask * norm(x_0, y)`), where it previously received
+  the pre-masked `(mask * x_0, mask * y)`; the two agree for the built-in `Lp`
+  norms, but a custom `norm` that relies on unobserved entries being zeroed
+  before the call may differ. The integer `norm` selector (e.g. `norm=2`) is
+  unaffected.
+- `Mesh.transform` and `compute_cotan_weights_fem` now use the non-checking
+  `torch.linalg.inv_ex` / `solve_ex` solvers, and build their index tensors on
+  device. The checked solvers read a status code back to the host on every call,
+  which synchronizes on CUDA; removing that and the index-tensor uploads takes
+  `Mesh.transform` on a cached codimension-one mesh from three host
+  synchronizations to one, and `compute_cotan_weights_fem` from six to three. As
+  a consequence,
+  `Mesh.transform(..., assume_invertible=True)` no longer raises when the matrix
+  is in fact singular: it propagates NaN caches instead, as its docstring now
+  documents. The default `assume_invertible=None` still tests the determinant
+  and is unaffected.
+- `physicsnemo.experimental.uq.VariationalGPHead` now takes `n_train` as a
+  required keyword-only argument, along with every argument after `input_dim`.
+  It was annotated optional while the constructor raised on `None`, so callers
+  that already pass it by keyword are unaffected. It also gains `matern_nu`,
+  which was previously hardcoded to 2.5 (still the default).
+
+### Deprecated
+
+- `physicsnemo.mesh.calculus.integrate_cell_data` and `integrate_point_data`
+  are deprecated in favor of `integrate(..., data_source="cells"|"points")`.
+  Compatibility wrappers remain available for this release and emit
+  `LegacyFeatureWarning`.
+
+### Removed
+
+### Fixed
+
+- `MeshReader` / `DomainMeshReader` sample discovery no longer uses
+  `pathlib.Path.glob`, which can silently drop entries under filesystem
+  metadata-server load (Lustre), causing training to proceed on a subset
+  of the dataset.
+- Unified external aerodynamics volume datasets now preserve in-file boundaries
+  by default, so GLOBE can resolve `boundaries.vehicle` during collation.
+  Point-based volume model templates explicitly opt into the existing
+  boundary-dropping reader optimization.
+- `compute_cotan_weights_fem`, and the calculus, curvature, and smoothing
+  routines built on it such as `Mesh.laplacian`, no longer fail on degenerate
+  cells in float32. The Gram-matrix regularization is now scale-free, so it also
+  covers cells with no extent — including the null cells that `Mesh.pad` and
+  `Mesh.pad_to_next_power` insert — and flat cells at large coordinate values,
+  both of which previously raised a singular-matrix `_LinAlgError` from
+  `torch.linalg.inv`. Weights for non-degenerate cells are unchanged bit for bit.
+- Multinomial index sampling now uses one shared `weighted_multinomial`
+  functional across datapipes, DoMINO, and remeshing. Its core API follows
+  `torch.multinomial`, adds allocation-free integer input for uniform
+  populations, and supports sampling with or without replacement. Exact
+  sampling without replacement uses `torch.randperm` or a chunked exponential
+  race, with an explicit low-memory Poisson-gap approximation for uniform
+  sampling. This removes the `torch.multinomial` `2^24` category limit for
+  sampling without replacement, consolidates duplicated Poisson index
+  samplers, and fixes incorrect chunk-local indices and biased per-chunk quotas
+  in DoMINO.
+- Unified external aerodynamics recipe: the aggregate metrics reported for
+  vector fields under the bare field name (e.g. `wss_l2`, likewise `_l1` /
+  `_mae`) were computed on per-point vector magnitudes, so direction errors
+  were invisible — a prediction with the correct magnitude but wrong direction
+  at every point scored 0. The bare-name aggregate is now computed over all
+  components jointly (whole-field relative norms, Frobenius for `l2`). The
+  broken magnitude-only aggregate is not retained under a separate key.
+  Per-component metrics (`wss_x_l2`, ...) were always direction-sensitive and
+  are unchanged, and training/checkpoints are unaffected (the training
+  objective goes through `LossCalculator`, not this metric path) — only
+  reported aggregate vector metrics were misleading.
+- Unified external aerodynamics recipe: model templates can now carry
+  known-good training overrides (`train.yaml`'s `_self_` merges before the
+  model template; all existing templates resolve identically). The GLOBE
+  example now uses the recipe's default `compile` and learning-rate
+  settings — both measured equivalent or better than the previously
+  documented overrides on the DrivAerML surface case — and no longer sets
+  `training.field_weights={pressure: 1.0, wss: 100.0}`, which was redundant
+  with `NormalizeMeshFields` normalization and starved the pressure field
+  of gradient signal (~2x worse converged pressure L2 at equal WSS L2).
+- `ShardTensor` now survives `torch.compile` / AOTAutograd for tensor-subclass
+  users: `__tensor_unflatten__` no longer forces `requires_grad` on the
+  reconstructed inner (matching DTensor, so the inner/wrapper flags cannot
+  disagree and trip `assert_metadata_eq` under a Dynamo graph-break re-fake),
+  and `__coerce_same_metadata_as_tangent__` is subclass-friendly — it accepts a
+  subclass's nested flatten context, treats empty and `None` sharding-shape maps
+  as equal, and rebuilds a differing `ShardTensor`-subclass tangent via that
+  type's own `__tensor_unflatten__` instead of returning `None` (the plain-tensor
+  / `DTensor` cross-type `None` convention is preserved).
+- `ShardTensor.to_local()` (and op-result forwards feeding it) is now
+  differentiable under `torch.compile` / AOTAutograd. Previously the compiled
+  backward was silently dropped (zero / missing gradient): ShardTensor's
+  `__torch_function__` eager fallback converts to `DTensor` through
+  `autograd.Function`s that AOTAutograd traces *through*, severing the primal's
+  gradient connection during the joint trace. Under tracing, unpatched ops now
+  pass through to `__torch_dispatch__` (mirroring `DTensor`, which defines no
+  `__torch_function__`), keeping the graph differentiable while eager behavior
+  and registered shard patches are unchanged.
+- Datapipe contiguous-block subsampling now wraps cyclically, giving boundary
+  and interior elements equal inclusion probability.
+- Cell-subsampled GLOBE inputs now retain their effective integration measure,
+  preventing area-weighted outputs and gradients from collapsing.
+- `SetGlobalField` now writes injected fields to the domain-level `global_data`
+  of a `DomainMesh`, in addition to the existing per-sub-mesh broadcast.
+  Previously, code reading `DomainMesh.global_data` never saw the injected
+  fields.
+- `physicsnemo.mesh.io.from_pyvista(..., force_copy=True)` now copies attached
+  point, cell, and global data as well as geometry. The matching new
+  `to_pyvista(..., force_copy=True)` option prevents exported PyVista geometry
+  and data from mutating the source `Mesh` through shared CPU storage.
+- `physicsnemo.mesh.io.from_pyvista` now supports native line/poly-line grids,
+  pixels, triangle strips, and pentagonal/hexagonal prisms, and selects explicit
+  dimensions from mixed `UnstructuredGrid` inputs while preserving selected
+  parent data. Explicit 1D conversion still derives the unique edge graph when
+  no native lines exist. Connectivity and attached-data invariants are validated
+  before VTK filters run. Unsupported higher-order topology is rejected pending
+  globally conforming tessellation, while explicit vertex point-cloud conversion
+  remains available without interpreting that topology. Centroid conversion
+  rejects parents that cannot preserve cell-data alignment.
+- `physicsnemo.mesh.sampling.sample_data_at_points` now handles integer and
+  boolean fields by returning `float64`, so NaN sentinels and non-integral
+  interpolation or multi-cell means are representable (subject to the usual
+  `float64` precision limits). Point-data interpolation now promotes field and
+  geometry dtypes consistently, and accumulation uses fewer full-sized
+  temporaries and CUDA host synchronizations.
+- `Mesh.point_data_to_cell_data` now handles integer and boolean point fields
+  by returning `float64`, instead of raising `mean(): could not infer output
+  dtype`. A mean of integers is generally non-integral, so it is computed in
+  floating point (subject to the usual `float64` precision limits). This
+  matches `Mesh.cell_data_to_point_data`, which already promoted discrete
+  fields the same way; floating-point and complex fields are unaffected.
+- `physicsnemo.mesh.projections.extrude` now produces a *conforming* (crack-free)
+  simplicial complex for multi-cell inputs. Each prism was previously tessellated
+  using the per-cell local vertex order, so adjacent cells that listed a shared
+  edge's endpoints in different orders split the shared quad face along opposite
+  diagonals; the resulting non-manifold volume leaked interior crack faces into
+  `get_boundary_mesh` (boundary edges shared by 4 faces — e.g. an extruded L-shape
+  or any multi-column grid, which also broke `repair.fix_orientation`). Parent-cell
+  vertices are now sorted into a global order before tessellation (the
+  Freudenthal-Kuhn subdivision), a no-op for already-sorted inputs.
+- `physicsnemo.mesh.generate.marching_cubes` now accepts `bfloat16` fields by
+  converting them to `float32` before crossing the NumPy boundary.
+- `physicsnemo.mesh.projections.extrude` now returns consistently oriented cells
+  for full-dimensional (codimension-0) output.
+- `physicsnemo.mesh.remeshing.remesh` now preserves the input mesh's device and
+  floating dtype instead of dropping them to CPU/float32.
+- `physicsnemo.mesh.io.to_pyvista` now preserves supported dtypes for attached
+  point, cell, and global data instead of narrowing every array to `float32`.
+  Reduced-precision floating-point values are promoted only as needed for VTK.
+- `physicsnemo.mesh.io.from_pyvista` and `to_pyvista` now preserve `float64`
+  point coordinates instead of unconditionally narrowing geometry to `float32`,
+  which could collapse small features on meshes with large coordinate offsets.
+  Existing `float32` geometry remains `float32`.
+- `physicsnemo.mesh`: `Mesh.to(<float dtype>)` and `DomainMesh.to(<float dtype>)`
+  raised `TypeError: cells must have an int-like dtype` because the cast was applied
+  to the integer `cells` tensor. A floating/complex dtype is now applied only to
+  floating tensors; the integer `cells` (and any integer data) are preserved. Device
+  moves are unchanged.
+- `physicsnemo.mesh`: fixed several silent-wrong-result bugs — `slice_cells`
+  carried stale point-level and non-local (`gaussian_curvature`) caches onto the
+  sliced mesh; the intrinsic LSQ gradient returned all-zeros for codimension >= 2
+  manifolds (now estimates the tangent space via local PCA); `smooth_laplacian`
+  returned stale geometry caches after its in-place point update; `transform`
+  propagated an incorrect point-normals cache under anisotropic/shear maps; and the
+  derived-mesh methods (`compute_point_derivatives`, `compute_cell_derivatives`,
+  `cell_data_to_point_data`, `point_data_to_cell_data`) aliased the source mesh's
+  mutable `_cache`.
+- `physicsnemo.mesh.spatial.ClusterTree.compute_source_aggregates` now
+  normalizes with its call-time area weights instead of the weights used when
+  constructing the tree, preserving correct aggregates when weights change.
+- `physicsnemo.mesh`: fixed crash / data-integrity bugs — `project(...)` with
+  `transform_point_data`/`transform_cell_data=True` mutated the input mesh in
+  place; visualization and `to_pyvista` crashed on autograd-tracked tensors (now
+  detached before `.numpy()`); and integer/bool data crashed (`safe_eps` on an
+  integer dtype) or truncated via integer division during facet/scatter
+  aggregation (now computed in a floating dtype).
+- `physicsnemo.mesh`: averaging a complex point or cell field no longer silently
+  returns `float64` with the imaginary part discarded. Complex tensors are not
+  "floating point" by `torch`'s definition, so facet/scatter aggregation
+  promoted them like an integer field, corrupting
+  `Mesh.cell_data_to_point_data`, `Mesh.get_facet_mesh` (both `data_source`
+  settings), and `repair.merge_duplicate_points`. A `"mean"` still requires
+  real weights, because its divisor is clamped away from zero and `clamp`
+  rejects complex dtypes; a `"sum"` accepts complex weights and promotes to the
+  common dtype of the values and the weights.
+- `physicsnemo.mesh` Morton-code quantization now handles empty inputs, tiny
+  extents, half-precision coordinates, and one-dimensional endpoints correctly.
+- `physicsnemo.mesh`: fixed Loop subdivision pulling open boundaries inward (now
+  applies the boundary/crease mask); subdivision zero-filling integer/bool
+  `point_data` at new edge vertices (now inherits a parent label);
+  non-deterministic orientation flips and over-counted component sizes in
+  `repair.fix_orientation`; random point sampling drawing barycentric weights in
+  float32 for float64 meshes; and `Mesh.merge` not validating `point_data` /
+  `global_data` key consistency.
+- Fixed `DefaultTrainingLoop` reading `DistributedManager.device` at the class
+  level (a `property` descriptor) instead of `DistributedManager().device`, which
+  left the loop's device set to a `property` object under an initialized
+  `DistributedManager` (`physicsnemo/active_learning/loop.py`).
+- Replaced three plain-string regex / docstring literals containing invalid
+  escape sequences with raw-string equivalents
+  (`physicsnemo/utils/logging/launch.py`,
+  `physicsnemo/metrics/general/calibration.py`,
+  `physicsnemo/metrics/general/crps.py`); these were `SyntaxWarning`s today
+  and become `SyntaxError`s in Python 3.16.
+- Various test cleanups to remove self-inflicted warnings in CI output:
+  disabled pytest collection for `TestModelA`/`TestModelB` helpers in
+  `test/core/test_registry.py` via `__test__ = False`; migrated
+  `test/nn/module/test_interpolation.py` to call the non-deprecated
+  `grid_to_point_interpolation` and added a dedicated test for the
+  deprecation alias; scoped a `lr_scheduler.step()`-before-`optimizer.step()`
+  `UserWarning` filter to a single test in
+  `test/optim/test_combined_optimizer.py`; guarded the
+  `DistributedManager.initialize()` calls in `test/utils/test_checkpoint.py`
+  with `is_initialized()`; and suppressed the import-time
+  `ExperimentalFeatureWarning` in `test/datapipes/healda/test_features.py`
+  via `warnings.catch_warnings()`.
+- Fixed `physicsnemo.utils.get_checkpoint_dir` returning paths with `\`
+  separators on Windows (e.g. `.\checkpoints_model`), which was inconsistent
+  with the `/`-based paths used elsewhere in the checkpoint utilities and
+  broke the `test_get_checkpoint_dir` CI test on Windows. The function now
+  always joins with `/`, working uniformly for local paths and `fsspec`
+  URIs (`msc://`, etc.) across operating systems.
+
+### Security
+
+### Dependencies
+
+- Raises the minimum TensorDict version to `tensordict[zarr]>=0.14.0`,
+  restoring the stable `tensordict` distribution while retaining Zarr support
+  and upstream bug fixes.
+- Removes `pyacvd` from the `mesh-extras` optional dependencies. Remeshing now
+  uses NVIDIA Warp.
+- Updates the minimum supported `warp-lang` version to 1.14.0.
+
+## [2.1.0] - 2026-05-26
+
+### Added
+
 - Adds GLOBE model (`physicsnemo.experimental.models.globe.model.GLOBE`),
   including new variant that uses a dual tree traversal algorithm to reduce the
   complexity of the kernel evaluations from O(N^2) to O(N).
@@ -71,6 +1266,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added geometry functionals in `physicsnemo.nn.functional` for
   `mesh_poisson_disk_sample`, `mesh_to_voxel_fraction`, and
   `signed_distance_field`.
+- Added rendering functionals in `physicsnemo.nn.functional` for isosurface,
+  mesh, volume, LIC, point cloud, wireframe, and RGBA transfer rendering, with
+  Warp kernels for rendering and PyTorch fallbacks for transfer functions.
 - Adds embedded OOD guardrail `OODGuard` at
   `physicsnemo.experimental.guardrails.embedded`, optionally
   wired into `GeoTransolver` via a new `guard_config` constructor argument.
@@ -132,11 +1330,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end-to-end training and sampling of epsilon-parameterized models.
   Losses gain an `epsilon_to_x0_fn` kwarg used for the epsilon-to-x0
   conversion required during DSM training.
-- Adds `DiffusionUNet3D` 3D U-Net diffusion backbone for volumetric data at
-  `physicsnemo.experimental.models.diffusion_unets`. Implements the
-  `DiffusionModel` protocol. Exposes reusable 3D building blocks
-  (`Conv3D`, `GroupNorm3D`, `UNetAttention3D`, `UNetBlock3D`) at
-  `physicsnemo.experimental.nn`.
 - Added support for Batched radius search, which enables Domino
   and GeoTransolver with local features and batch size > 1.
 - Added the underfill recipe.
@@ -217,6 +1410,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   combined-workflow and from-checkpoint round-trip tests. Most tests
   run with `fullgraph=True` and `error_on_recompile` to catch
   `torch.compile` regressions.
+- Internal weight initialization in the distributed AFNO layers and the
+  `EarthAttention` blocks of `physicsnemo.nn.module.attention_layers` now
+  dispatches to `torch.nn.init.trunc_normal_` directly instead of going
+  through frozen in-tree copies of the pre-PyTorch-2.12 inverse-CDF
+  implementation. PyTorch 2.12 reimplemented `trunc_normal_` as a
+  rejection-sampling loop on top of `normal_()` (see
+  [pytorch/pytorch#174997](https://github.com/pytorch/pytorch/pull/174997)),
+  so seeded from-scratch initialization consumes the RNG stream
+  differently on 2.12+ vs older versions. Existing trained checkpoints
+  are unaffected (loading bypasses init). Forward-accuracy reference
+  outputs for `AFNO`, `ModAFNO`, `Transolver`, `FLARE`, and `Pangu` were
+  regenerated against the new algorithm. Rather than wiring per-model
+  skips, `test.common.validate_forward_accuracy` now uniformly skips on
+  `torch < 2.12` (the reference data is locked to that floor via a single
+  `_REFERENCE_DATA_MIN_TORCH` constant; bump it when a PyTorch
+  release next changes an init/RNG algorithm any forward-accuracy model
+  depends on, and regenerate the `.pth` files at the same time).
 
 ### Deprecated
 
@@ -224,41 +1434,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isosurface extraction, use `physicsnemo.mesh.generate.marching_cubes` instead
   of `sdf_to_stl`. For VTP/OBJ/STL file conversion (`combine_vtp_files`,
   `convert_tesselated_files_in_directory`), use VTK or PyVista directly.
+- `physicsnemo.nn.module.utils.trunc_normal_` (and its submodule path
+  `physicsnemo.nn.module.utils.weight_init.trunc_normal_`) is deprecated
+  and will be removed in v2.2.0. It is now a thin wrapper around
+  `torch.nn.init.trunc_normal_` that emits a `DeprecationWarning` on
+  call, replacing the frozen in-tree copy of the legacy inverse-CDF
+  implementation. Use `torch.nn.init.trunc_normal_` directly.
+- Deprecates the CorrDiff example (`examples/weather/corrdiff`), which no longer
+  receives maintenance, bug fixes, or new features. Use the regional
+  high-resolution weather model example
+  (`examples/weather/regional_weather_diffusion`) instead.
+  That example unifies regional diffusion-based weather models, and covers the
+  CorrDiff downscaling setting alongside other diffusion-based settings.
 
 ### Removed
 
+- The legacy in-tree `trunc_normal_` implementation that lived in
+  `physicsnemo/models/afno/distributed/layers.py` (`_trunc_normal_` /
+  `_no_grad_trunc_normal_`) is removed. These names were private; all
+  in-tree call sites now use `torch.nn.init.trunc_normal_`.
+
 ### Fixed
 
-- Replaced three plain-string regex / docstring literals containing invalid
-  escape sequences with raw-string equivalents
-  (`physicsnemo/utils/logging/launch.py`,
-  `physicsnemo/metrics/general/calibration.py`,
-  `physicsnemo/metrics/general/crps.py`); these were `SyntaxWarning`s today
-  and become `SyntaxError`s in Python 3.16.
-- Various test cleanups to remove self-inflicted warnings in CI output:
-  disabled pytest collection for `TestModelA`/`TestModelB` helpers in
-  `test/core/test_registry.py` via `__test__ = False`; migrated
-  `test/nn/module/test_interpolation.py` to call the non-deprecated
-  `grid_to_point_interpolation` and added a dedicated test for the
-  deprecation alias; scoped a `lr_scheduler.step()`-before-`optimizer.step()`
-  `UserWarning` filter to a single test in
-  `test/optim/test_combined_optimizer.py`; guarded the
-  `DistributedManager.initialize()` calls in `test/utils/test_checkpoint.py`
-  with `is_initialized()`; and suppressed the import-time
-  `ExperimentalFeatureWarning` in `test/datapipes/healda/test_features.py`
-  via `warnings.catch_warnings()`.
-- Fixed `physicsnemo.utils.get_checkpoint_dir` returning paths with `\`
-  separators on Windows (e.g. `.\checkpoints_model`), which was inconsistent
-  with the `/`-based paths used elsewhere in the checkpoint utilities and
-  broke the `test_get_checkpoint_dir` CI test on Windows. The function now
-  always joins with `/`, working uniformly for local paths and `fsspec`
-  URIs (`msc://`, etc.) across operating systems.
 - Fixed functional benchmark plot fallback labeling so unlabeled ASV results use
   the same key ordering as the benchmark runner.
 - Fixed graph break caused by `FunctionSpec` dispatch (`max(key=)` is not supported by `torch.compile`)
 - Fixed bug in Pangu, FengWu attention window shift for asymmetric longitudes
-- Fixed a bug in `mesh.sampling.find_nearest_cells`, where a mixup between L2 and L-inf norms
-  could cause slightly incorrect nearest-neighbor assignments in highly skewed meshes.
+- Fixed a bug in `mesh.sampling.find_nearest_cells`, where a mixup between L2 and L-inf
+  norms could cause slightly incorrect nearest-neighbor assignments in highly skewed
+  meshes.
 - Fixed TensorDict key-ordering bug in GLOBE's Barnes-Hut kernel that caused
   incorrect results when `tensordict >= 0.12` reordered leaves during
   TensorDict construction from dict literals mixing plain and nested keys.
@@ -296,12 +1500,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed the sinusoidal positional embeddings formula in `SongUNet` and
   `MultiDiffusionModel2D` so it now follows the standard `sin / cos`
   convention. Affected reference data was regenerated.
-
-### Security
+- Constructing a `Mesh` (or `DomainMesh`) inside a `torch.compile`-traced
+  function no longer raises `AttributeError` / `KeyError` or silently
+  produces wrong output. The breakage came from two regressions in
+  `tensordict >= 0.12.0` (PR `pytorch/tensordict#1552`), where the
+  `@tensorclass` init wrapper's bypass branch silently skipped both
+  field-default normalization and `__post_init__` under
+  `torch.compile`. We pin `tensordict < 0.12` until the upstream fix
+  (`pytorch/tensordict#1708`, `pytorch/tensordict#1709`) ships, and add
+  a regression test (`test/mesh/mesh/test_compile.py`) that constructs
+  a `Mesh` inside `torch.compile` and reads cached properties, so the
+  same bug cannot return on a future pin bump unnoticed.
 
 ### Dependencies
 
 - Increments minimum viable PyTorch version to `torch>=2.5.0` to support FSDP better
+- Upper-bounds `tensordict < 0.12` to avoid the `torch.compile` regressions
+  in `tensordict >= 0.12.0` (see corresponding entry under Fixed).
 
 ## [2.0.0] - 2026-03-09
 

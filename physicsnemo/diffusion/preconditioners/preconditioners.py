@@ -499,8 +499,14 @@ class BaseAffinePreconditioner(Module, ABC):
             _ensure_plain_tensor(c) for c in (c_in, c_noise, c_out, c_skip)
         )
 
-        x_mesh = getattr(x, "device_mesh", None)
-        if x_mesh is not None:
+        # Only manually promote coefficients for genuine (non-Shard) DTensor
+        # activations. A ShardTensor subclasses torch.Tensor (not DTensor), so
+        # it never matches this check; its dispatch path auto-promotes plain
+        # coefficients to replicated tensors on its mesh on the way in, so
+        # leaving them plain here avoids over-wrapping scalar coefficients (which
+        # otherwise breaks ops like PositionalEmbedding's torch.outer).
+        if isinstance(x, DTensor):
+            x_mesh = x.device_mesh
             c_in, c_noise, c_out, c_skip = (
                 _replicate_on_mesh(c, x_mesh) for c in (c_in, c_noise, c_out, c_skip)
             )
@@ -547,12 +553,12 @@ class VPPreconditioner(BaseAffinePreconditioner):
         c_{\text{out}} &= -\sigma \\
         c_{\text{in}} &= \frac{1}{\sqrt{\sigma^2 + 1}} \\
         c_{\text{noise}} &= (M - 1) \cdot \sigma^{-1}(\sigma)
-    
+
     With these coefficients, the preconditioned model output is expected to be
     an :math:`\mathbf{x}_0`-prediction (clean data estimate).
     This preconditioner is not directly compatible for score-prediction
     training or others.
-    
+
     For training, it is usually paired with
     :class:`~physicsnemo.diffusion.metrics.losses.MSEDSMLoss`
     (``prediction_type="x0"``) and
@@ -693,11 +699,11 @@ class VEPreconditioner(BaseAffinePreconditioner):
         c_{\text{out}} &= \sigma \\
         c_{\text{in}} &= 1 \\
         c_{\text{noise}} &= \log(0.5 \cdot \sigma)
-    
+
     With these coefficients, the preconditioned model output is expected to be an
     :math:`\mathbf{x}_0`-prediction (clean data estimate). This preconditioner
     is not directly compatible for score-prediction training or others.
-    
+
     For training, it is usually paired with
     :class:`~physicsnemo.diffusion.metrics.losses.MSEDSMLoss`
     (``prediction_type="x0"``) and
@@ -788,7 +794,7 @@ class IDDPMPreconditioner(BaseAffinePreconditioner):
 
     Implements the preconditioning scheme from the improved DDPM
     formulation.
-    
+
     The preconditioning coefficients are:
 
     .. math::
@@ -805,7 +811,7 @@ class IDDPMPreconditioner(BaseAffinePreconditioner):
     an :math:`\mathbf{x}_0`-prediction (clean data estimate). This
     preconditioner is not directly compatible for score-prediction training or
     others.
-    
+
     For training, it is usually paired with
     :class:`~physicsnemo.diffusion.metrics.losses.MSEDSMLoss`
     (``prediction_type="x0"``) and

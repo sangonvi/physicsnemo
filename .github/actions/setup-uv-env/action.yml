@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 name: Setup uv environment
 description: |
   Restore the uv download cache and build a deterministic Python virtual
@@ -33,9 +49,9 @@ inputs:
   extras:
     description: |
       Extras to activate when building the venv (comma-separated, passed
-      as repeated `--extra` flags).  Defaults to "cu12".
+      as repeated `--extra` flags).  Defaults to "cu13".
     required: false
-    default: "cu12"
+    default: "cu13"
 outputs:
   uv_cache_hit:
     description: Whether the uv download cache had an exact key hit
@@ -105,6 +121,10 @@ runs:
         UV_LINK_MODE: copy
         UV_FROZEN: "1"
         UV_NO_SYNC: "1"
+        # Use only the container's Python.
+        UV_PYTHON: python3
+        UV_PYTHON_DOWNLOADS: never
+        UV_NO_MANAGED_PYTHON: "1"
       run: |
         set -euo pipefail
         echo "::group::build venv (extras=${{ inputs.extras }})"
@@ -118,7 +138,34 @@ runs:
             extra_flags+=(--extra "$e_trimmed")
           fi
         done
-        uv sync --frozen --group dev "${extra_flags[@]}"
+        # Work around Transformer Engine's CUDA 13 build dependency discovery.
+        # The upstream fix is merged but absent from TE 2.18 and 2.19:
+        # https://github.com/NVIDIA/TransformerEngine/pull/3251
+        # Remove the two-stage sync and CUDA/include path overrides once
+        # the minimum supported TE release includes that fix.
+        #
+        # `--no-install-package torch-{cluster,scatter,sparse}` (BOTH
+        # syncs): the `gnns` extra would otherwise build all three PyG
+        # packages from their sdists here, in an isolated build env with
+        # no CUDA toolchain configured, producing CPU-only wheels at
+        # ~10 min each.  All three are replaced in "Install CI-only test
+        # dependencies" anyway by FORCE_CUDA=1 source builds. Building
+        # them here would cache CPU-only wheels keyed on the sdist alone
+        # (env vars are not part of the key), so the later
+        # `--reinstall-package` would silently reuse the
+        # CPU-only wheel instead of rebuilding with CUDA.
+        pyg_skip=(
+          --no-install-package torch-cluster
+          --no-install-package torch-scatter
+          --no-install-package torch-sparse
+        )
+        uv sync --frozen --group dev "${extra_flags[@]}" "${pyg_skip[@]}" \
+          --no-install-package transformer-engine-torch
+        sp="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+        CUDA_HOME="$sp/nvidia/cu13" \
+        CPLUS_INCLUDE_PATH="$sp/nvidia/cudnn/include:$sp/nvidia/nccl/include" \
+        MAX_JOBS=16 \
+          uv sync --frozen --group dev "${extra_flags[@]}" "${pyg_skip[@]}"
         echo "::endgroup::"
 
     # --- Verification phase ----------------------------------------------
@@ -131,6 +178,13 @@ runs:
         set -euo pipefail
         echo "::group::verify environment"
         .venv/bin/python --version
+        # Keep the venv Python aligned with the cache key.
+        venv_py="$(.venv/bin/python -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+        sys_py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+        if [ "$venv_py" != "$sys_py" ]; then
+          echo "::error::venv Python ${venv_py} does not match system python3 ${sys_py}"
+          exit 1
+        fi
         .venv/bin/python -c "import torch; print(f'torch={torch.__version__} cuda={torch.version.cuda}')"
         echo "::endgroup::"
 
@@ -166,63 +220,69 @@ runs:
         fi
 
     # --- CI-only test dependencies ----------------------------------------
-    # These modules are referenced by tests in test/ via @requires_module
-    # or pytest.importorskip but have no home in pyproject extras (either
-    # because they are pure CI test tooling like moto, or because they
-    # require special install paths like the PyG wheel index).  Installed
-    # via `uv pip install` AFTER the lockfile-mutation guard so uv.lock
-    # remains the single source of truth for the synced environment, and
-    # this step layers on top without invalidating that guarantee.
-    #
-    # Spec coupling notes:
-    #   * Pure-PyPI specs mirror Dockerfile:240-243 to keep container and
-    #     CI environments in lockstep.
-    #   * The PyG --find-links URL encodes the locked torch version (see
-    #     uv.lock entry for torch 2.11.0+cu128).  Bump the
-    #     torch-X.Y.Z+cu128 segment in lockstep when the torch pin moves
-    #     -- same hand-maintained coupling already documented for the
-    #     natten wheel index in pyproject.toml.
-    #
-    # earth2grid is intentionally NOT installed here: the source build
-    # (see Dockerfile:246 for the canonical pin) is fragile in the CI
-    # container.  HEALPix tests will continue to skip via @requires_module
-    # until earth2grid ships a wheel or the build is fixed.
-    #
-    # torch_scatter / torch_sparse / torch_cluster are pulled in as a
-    # source build via the gnns extra.  Without CUDA toolchain visible
-    # at build time uv lands the CPU-only wheel, which makes FigConvNet
-    # (and any model calling torch_scatter.segment_csr / similar on a
-    # CUDA tensor) fail with "Not compiled with CUDA support".  Force a
-    # reinstall from the PyG wheel index, which ships pre-built CUDA
-    # wheels matching the locked torch version.
+    # Test deps with no home in pyproject extras (pure CI tooling, or
+    # special install paths like the PyG wheel index) layered on top of
+    # the synced env.  Installed AFTER the lockfile-mutation guard so
+    # uv.lock remains the single source of truth for the synced
+    # environment; this step layers on top without invalidating that
+    # guarantee.  Pin list and per-pin rationale live in
+    # .github/ci-requirements.txt; the pinned transitive closure lives in
+    # .github/ci-requirements.lock (see .github/regen-ci-deps-lock.sh).
     - name: Install CI-only test dependencies
       shell: bash
       env:
         UV_LINK_MODE: copy
-        PYG_WHL_INDEX: "https://data.pyg.org/whl/torch-2.11.0+cu128.html"
-        # cuml-cu12 -> cudf -> numba caps numpy at <=2.2; uv.lock pins
-        # numpy 2.2.6 under the cu12 extra precisely for this reason.
-        # Without an explicit constraint here, uv pip install resolves
-        # transitive deps (e.g. tensorstore, pyarrow) freely and bumps
-        # numpy to 2.4.x, which crashes every test that touches cuml.
-        # Re-applying the cap on each layered install keeps numba happy.
-        NUMPY_PIN: "numpy<2.3"
+        # scatter, sparse, and cluster have no torch 2.13 wheels; build
+        # their PyPI sdists here (see .github/ci-requirements.txt).
+        # This is their only build: the `uv sync` calls exclude them, so
+        # there is no earlier CPU-only build in the uv cache for this
+        # step to reuse. FORCE_CUDA=1 makes the builds compile their CUDA
+        # kernels even on the GPU-less build-environment runner that
+        # warms the uv cache (nvcc comes from the cuda devel container),
+        # and the fixed arch list keeps the cached wheel valid on the
+        # H100 (sm90) GPU runners that consume it.
+        FORCE_CUDA: "1"
+        TORCH_CUDA_ARCH_LIST: "9.0"
       run: |
         set -euo pipefail
         echo "::group::install CI-only test dependencies"
+        # This step installs the CUDA builds of the four PyG packages:
+        # pyg_lib from the --find-links index baked into the requirements
+        # file, scatter/sparse/cluster built from source. None are present
+        # after `uv sync` (the PyG sdists are excluded there), so these
+        # are plain installs. Keep `--reinstall-package` so a CPU-only
+        # copy can never survive if that exclusion is ever dropped.
+        # `--reinstall-package` (NOT bare `--reinstall`) is scoped to
+        # exactly those four names on purpose.  Bare
+        # `--reinstall` would imply `--refresh` over the FULL resolved
+        # closure (~60 packages including transitive deps like pyarrow,
+        # cryptography, opentelemetry), bumping them to whatever's
+        # currently latest on PyPI and breaking ABI compatibility with
+        # the lockfile-pinned GPU stack (cudf / cuml / pylibcudf were
+        # built against the synced pyarrow ABI, etc.).
+        #
+        # `--constraint .github/ci-requirements.lock` pins the transitive
+        # closure of the CI-only deps so testmon's `system_packages`
+        # fingerprint matches between the nightly that builds the testmon
+        # DB and the PR that consumes it.  Without this, unpinned
+        # transitives of moto / scikit-image / multi-storage-client /
+        # tensorstore / etc. resolve to whatever's latest on PyPI at job
+        # time and invalidate the entire testmon cache.  Regenerate the
+        # lock via .github/regen-ci-deps-lock.sh whenever a `==` pin in
+        # .github/ci-requirements.txt changes.
+        # These sdists import torch at build time. Disabling isolation
+        # for these packages lets the builds see the synced .venv's torch
+        # and setuptools instead of failing in an empty build env.
         uv pip install --python .venv/bin/python \
-          "$NUMPY_PIN" \
-          "moto[s3]>=5.0.28" \
-          "numpy-stl" \
-          "scikit-image>=0.24.0" \
-          "shapely" \
-          "multi-storage-client[boto3]>=0.33.0" \
-          "tensorstore" \
-          "pyarrow"
-        uv pip install --python .venv/bin/python --reinstall \
-          "$NUMPY_PIN" \
-          torch_scatter torch_sparse torch_cluster pyg_lib \
-          --find-links "$PYG_WHL_INDEX"
+          --reinstall-package torch_scatter \
+          --reinstall-package torch_sparse \
+          --reinstall-package torch_cluster \
+          --reinstall-package pyg_lib \
+          --no-build-isolation-package torch_scatter \
+          --no-build-isolation-package torch_sparse \
+          --no-build-isolation-package torch_cluster \
+          --constraint .github/ci-requirements.lock \
+          -r .github/ci-requirements.txt
         echo "::endgroup::"
 
     - name: Report cache sizes

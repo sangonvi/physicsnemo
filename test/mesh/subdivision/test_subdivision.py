@@ -20,8 +20,11 @@ Tests linear, butterfly, and loop subdivision schemes across various
 manifold dimensions, spatial dimensions, and codimensions.
 """
 
+import math
+
 import pytest
 import torch
+from tensordict import TensorDict
 
 from physicsnemo.mesh.mesh import Mesh
 
@@ -143,6 +146,26 @@ class TestLinearSubdivision:
         # After 1 level: 4 + 6 = 10 points, 1 * 8 = 8 tets
         assert subdivided.n_points == 10
         assert subdivided.n_cells == 8
+
+    def test_tet_subdivision_preserves_orientation(self, device):
+        """Regression: every child tet keeps the parent's orientation.
+
+        Midpoint subdivision splits a tet into 8 children of equal volume, so
+        each child's signed volume is 1/8 of the parent's.
+        """
+        mesh = create_tet_mesh(device)
+
+        def signed_volumes(m):
+            v = m.points[m.cells]
+            return torch.linalg.det(v[:, 1:] - v[:, :1]) / 6
+
+        parent_volume = signed_volumes(mesh)[0]
+        assert parent_volume > 0
+        subdivided = mesh.subdivide(levels=1, filter="linear")
+        torch.testing.assert_close(
+            signed_volumes(subdivided),
+            torch.full((8,), parent_volume.item() / 8, device=device),
+        )
 
     def test_multi_level_subdivision(self, device):
         """Test multiple levels of subdivision."""
@@ -345,6 +368,43 @@ class TestButterflySubdivision:
             # Acceptable to not support non-2D manifolds
             assert "manifold" in str(e).lower() or "dimension" in str(e).lower()
 
+    @pytest.mark.parametrize(
+        "cells",
+        [
+            # The colliding edges are both interior edges
+            [
+                [0, 1, 2],
+                [1, 0, 3],
+                [42949, 67297, 4],
+                [67297, 42949, 5],
+            ],
+            # (42949, 67297) is also a wing edge of the interior edge (6, 42949)
+            [
+                [42949, 6, 67297],
+                [6, 42949, 7],
+                [67297, 42949, 8],
+                [0, 1, 2],
+                [1, 0, 3],
+            ],
+        ],
+        ids=["interior_edges", "wing_edge"],
+    )
+    def test_butterfly_int32_cells_match_int64(self, device, cells):
+        """Regression: int32 connectivity gives the same result as int64.
+
+        With 100000 points, edges (0, 1) and (42949, 67297) have edge hashes
+        1 and 2**32 + 1, which collide if the hash is computed in int32. The
+        second case also checks the hashes of the stencil's wing edges.
+        """
+        n_points = 100_000
+        points = torch.rand(
+            n_points, 3, generator=torch.Generator().manual_seed(0), dtype=torch.float64
+        ).to(device)
+        cells = torch.tensor(cells, device=device)
+        expected = Mesh(points=points, cells=cells).subdivide(1, "butterfly")
+        actual = Mesh(points=points, cells=cells.int()).subdivide(1, "butterfly")
+        torch.testing.assert_close(actual.points, expected.points)
+
 
 ### Test Loop Subdivision
 
@@ -413,6 +473,36 @@ class TestLoopSubdivision:
             "Loop subdivision should produce reasonably uniform cell areas"
         )
 
+    def test_loop_open_mesh_int32_cells_match_int64(self, device):
+        """Regression: Loop on an open mesh with int32 connectivity."""
+        mesh = create_triangle_mesh(device)
+        expected = mesh.subdivide(levels=1, filter="loop")
+        mesh_int32 = Mesh(points=mesh.points, cells=mesh.cells.int())
+        actual = mesh_int32.subdivide(levels=1, filter="loop")
+        torch.testing.assert_close(actual.points, expected.points)
+        assert torch.equal(actual.cells.long(), expected.cells)
+
+    def test_loop_vertex_rule_float64_precision(self, device):
+        """Regression: Loop weights are computed in float64 for float64 meshes."""
+        from physicsnemo.mesh.primitives.surfaces import icosahedron_surface
+
+        mesh = icosahedron_surface.load(device=device)
+        mesh = Mesh(points=mesh.points.double(), cells=mesh.cells)
+
+        # Every icosahedron vertex has valence 5
+        n = 5
+        beta = (5 / 8 - (3 / 8 + math.cos(2 * math.pi / n) / 4) ** 2) / n
+        neighbor_sums = torch.zeros_like(mesh.points)
+        edges = mesh.cells[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2)
+        # Each edge appears in two triangles, once in each direction
+        neighbor_sums.index_add_(0, edges[:, 0], mesh.points[edges[:, 1]])
+        expected = (1 - n * beta) * mesh.points + beta * neighbor_sums
+
+        subdivided = mesh.subdivide(levels=1, filter="loop")
+        torch.testing.assert_close(
+            subdivided.points[: mesh.n_points], expected, rtol=0, atol=1e-14
+        )
+
 
 ### Test Edge Cases and Validation
 
@@ -465,6 +555,31 @@ class TestSubdivisionValidation:
         assert "timestamp" in subdivided.global_data
         assert subdivided.global_data["timestamp"] == 42.0
 
+    @pytest.mark.parametrize("filter", ["linear", "loop", "butterfly"])
+    def test_global_data_container_is_independent(self, device, filter):
+        """Adding global data to the result must not add it to the source."""
+        mesh = create_triangle_mesh(device)
+        mesh.global_data["timestamp"] = torch.tensor(42.0, device=device)
+
+        subdivided = mesh.subdivide(levels=1, filter=filter)
+        subdivided.global_data["new"] = torch.tensor(0.0, device=device)
+
+        assert "new" not in mesh.global_data.keys()
+
+    @pytest.mark.parametrize("filter", ["linear", "loop", "butterfly"])
+    def test_empty_cell_data_takes_cells_device(self, device, filter):
+        """Empty cell data without a device ends up on the cells' device."""
+        mesh = create_triangle_mesh(device)
+        mesh = Mesh(
+            points=mesh.points,
+            cells=mesh.cells,
+            cell_data=TensorDict({}, batch_size=[mesh.n_cells]),
+        )
+
+        subdivided = mesh.subdivide(levels=1, filter=filter)
+
+        assert subdivided.cell_data.device == mesh.cells.device
+
 
 ### Performance and Scaling Tests
 
@@ -516,3 +631,53 @@ class TestSubdivisionScaling:
         # Should handle reasonably large mesh
         subdivided = mesh.subdivide(levels=1, filter="linear")
         assert subdivided.n_cells == mesh.n_cells * 4
+
+
+def test_loop_subdivision_preserves_open_boundary():
+    """Regression: Loop subdivision must apply the boundary mask to boundary
+    vertices, not the interior one-ring rule. On a flat patch the boundary must
+    stay straight (no inward shrinkage). Loop preserves original-vertex indices, so
+    the original boundary mid-edge vertices stay at indices 0..n-1.
+    """
+    # 3x3 grid -> 8 triangles, a flat unit-square patch with an open boundary.
+    coords = [[i * 0.5, j * 0.5] for j in range(3) for i in range(3)]
+    points = torch.tensor(coords, dtype=torch.float64)
+    cells = []
+    for j in range(2):
+        for i in range(2):
+            v00, v10 = j * 3 + i, j * 3 + i + 1
+            v01, v11 = (j + 1) * 3 + i, (j + 1) * 3 + i + 1
+            cells += [[v00, v10, v11], [v00, v11, v01]]
+    mesh = Mesh(points=points, cells=torch.tensor(cells, dtype=torch.int64))
+
+    sub = mesh.subdivide(levels=1, filter="loop")
+
+    zero = torch.tensor(0.0, dtype=torch.float64)
+    one = torch.tensor(1.0, dtype=torch.float64)
+    # Mid-edge boundary vertices have two collinear boundary neighbours, so the
+    # boundary mask keeps them exactly on their straight boundary line.
+    assert torch.isclose(sub.points[1, 1], zero, atol=1e-9)  # bottom-mid stays y=0
+    assert torch.isclose(sub.points[7, 1], one, atol=1e-9)  # top-mid stays y=1
+    assert torch.isclose(sub.points[3, 0], zero, atol=1e-9)  # left-mid stays x=0
+    assert torch.isclose(sub.points[5, 0], one, atol=1e-9)  # right-mid stays x=1
+
+
+def test_subdivision_preserves_integer_point_data():
+    """Regression: integer/bool point_data at new edge vertices must inherit a parent
+    label (not be zero-filled, which silently introduced a spurious 0 label).
+    """
+    points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    cells = torch.tensor([[0, 1, 2]], dtype=torch.int64)
+    mesh = Mesh(points=points, cells=cells)
+    mesh.point_data["region"] = torch.tensor([10, 20, 30], dtype=torch.int64)
+
+    sub = mesh.subdivide(levels=1, filter="linear")
+    region = sub.point_data["region"]
+
+    assert region.dtype == torch.int64
+    # Original vertices unchanged (originals come first).
+    assert torch.equal(region[:3], torch.tensor([10, 20, 30]))
+    # New edge-midpoint labels must be valid parent labels, never the spurious 0.
+    new_labels = region[3:]
+    assert (new_labels != 0).all()
+    assert torch.isin(new_labels, torch.tensor([10, 20, 30])).all()

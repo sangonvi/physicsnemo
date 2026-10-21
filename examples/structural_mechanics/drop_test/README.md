@@ -15,7 +15,7 @@ The implementation uses a GeoTransolver backbone with one-shot training and is c
 
 ## Prerequisites
 
-**Data:** OpenRadioss drop-test data preprocessed into VTU format using [PhysicsNeMo-Curator](https://github.com/NVIDIA/physicsnemo-curator/tree/main/examples/structural_mechanics/drop_test). See [Data Preprocessing](#data-preprocessing) below.
+**Data:** OpenRadioss drop-test data preprocessed into VTU format using [PhysicsNeMo-Curator](https://github.com/NVIDIA/physicsnemo-curator/tree/main/examples/cae/drop). See [Data Preprocessing](#data-preprocessing) below.
 
 **Code dependencies:**
 
@@ -23,7 +23,7 @@ The implementation uses a GeoTransolver backbone with one-shot training and is c
 pip install -r requirements.txt
 ```
 
-GeoTransolver lives under `physicsnemo.experimental.models`, so a standard PhysicsNeMo install is sufficient — no extras required.
+GeoTransolver lives under `physicsnemo.models`, so a standard PhysicsNeMo install needs no extras.
 
 ## Data Preprocessing
 

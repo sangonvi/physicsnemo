@@ -19,15 +19,20 @@
 import pytest
 import torch
 
+from physicsnemo.diffusion.guidance import (
+    DataConsistencyDPSGuidance,
+    DPSScorePredictor,
+    ModelConsistencyDPSGuidance,
+)
 from physicsnemo.diffusion.noise_schedulers import (
     EDMNoiseScheduler,
     VENoiseScheduler,
     VPNoiseScheduler,
 )
-from physicsnemo.diffusion.samplers import sample
-from physicsnemo.diffusion.samplers.solvers import (
+from physicsnemo.diffusion.samplers import (
     EulerSolver,
     HeunSolver,
+    sample,
 )
 
 from .conftest import GLOBAL_SEED
@@ -39,6 +44,7 @@ from .helpers import (
     gpu_rng_roundtrip,
     instantiate_model_deterministic,
     load_or_create_reference,
+    make_differentiable_solver_options,
     make_input,
 )
 
@@ -50,11 +56,15 @@ REF_PREFIX = "test_samplers_"
 BATCH = 2
 NUM_STEPS = 2
 NUM_STEPS_SHORT = 2
+NUM_STEPS_GRAD = 3
 
-# Sampler non-regression tolerances — looser than single-op tests because
-# errors accumulate over multiple solver steps across different CPU ISAs.
+# Sampler non-regression tolerances: looser than single-op tests, since errors
+# accumulate over solver steps and across CPU ISAs.
 SAMPLER_CPU_TOLERANCES = {"atol": 20.0, "rtol": 5e-2}
 SAMPLER_GPU_TOLERANCES = {"atol": 20.0, "rtol": 5e-2}
+SAMPLER_RNG_TOLERANCES = {
+    "stoch_exp_euler_renoise": {"atol": 1e-9, "rtol": 1e-7},
+}
 
 SPATIAL_CONFIGS = [
     ("1d", (BATCH, 3, 16), FlatLinearX0Predictor, {"features": 3 * 16}),
@@ -70,6 +80,10 @@ SCHEDULER_CONFIGS = [
 
 PREDICTOR_TYPES = ["x0", "score", "epsilon"]
 
+# Guided sub-parameterization (DPS guidance), crossed with the common config
+# only in the guided methods. Guided sampling uses the euler solver.
+GUIDANCE_CONFIGS = ["data_l2", "model_l2_sda"]
+
 
 class _CustomEulerSolver:
     """User-defined solver implementing the Solver protocol from scratch."""
@@ -84,8 +98,12 @@ class _CustomEulerSolver:
         return x + (t_next_bc - t_cur_bc) * d
 
 
-# (solver_key, solver_options, sampler_name, uses_rng)
-# "_custom_euler" is handled specially to create a _CustomEulerSolver instance.
+# (solver_key, solver_options, sampler_name, uses_rng). "_custom_euler" maps
+# to a _CustomEulerSolver instance via _make_solver_arg. The "_use_*" keys are
+# sentinels resolved by _make_solver_arg: they build schedule callbacks from
+# the scheduler of the test. The configs of the exponential and
+# DPM-Solver++(2M) solvers mirror the docstring examples of their classes;
+# the scheduler axis of the tests covers the noise schedules of the examples.
 SAMPLER_CONFIGS = [
     ("euler", {}, "euler", False),
     ("heun", {}, "heun", False),
@@ -103,6 +121,57 @@ SAMPLER_CONFIGS = [
         "stoch_heun",
         True,
     ),
+    # DDIM sampling: the affine coefficients of the x0-parameterization
+    (
+        "exponential_euler",
+        {"_use_linear_fn": True, "_use_slope_fn": True},
+        "exponential_euler",
+        False,
+    ),
+    # EDM-style churn on top of the exponential Euler update
+    (
+        "edm_stochastic_exponential_euler",
+        {
+            "S_churn": 40,
+            "num_steps": 18,
+            "_use_linear_fn": True,
+            "_use_slope_fn": True,
+        },
+        "stoch_exp_euler",
+        True,
+    ),
+    # Stochastic DDIM (full noise renewal) for distilled few-step and
+    # consistency models
+    (
+        "edm_stochastic_exponential_euler",
+        {
+            "renoise": 1.0,
+            "_use_linear_fn": True,
+            "_use_slope_fn": True,
+            "_use_sigma_fns": True,
+        },
+        "stoch_exp_euler_renoise",
+        True,
+    ),
+    # Classical two-step Adams-Bashforth: default callbacks
+    ("dpmpp_2m", {}, "dpmpp_2m_ab2", False),
+    # Original DPM-Solver++(2M): log-SNR extrapolation coordinate
+    (
+        "dpmpp_2m",
+        {"_use_linear_fn": True, "_use_slope_fn": True, "_use_log_snr_lambda": True},
+        "dpmpp_2m",
+        False,
+    ),
+    # Corrected two-step Adams-Bashforth: default callbacks
+    ("dpmpp_2m_unic2", {}, "dpmpp_2m_unic2_default", False),
+    # DPM-Solver++(2M) with the UniC-2 corrector: log-SNR extrapolation
+    # coordinate
+    (
+        "dpmpp_2m_unic2",
+        {"_use_linear_fn": True, "_use_slope_fn": True, "_use_log_snr_lambda": True},
+        "dpmpp_2m_unic2",
+        False,
+    ),
 ]
 
 TIME_EVAL_INDICES = [0, 1]
@@ -118,15 +187,58 @@ def _make_sampling_components(
     seed=0,
     num_steps=NUM_STEPS,
     predictor_type="x0",
+    guidance_config=None,
+    create_graph=False,
+    retain_graph=False,
 ):
-    """Create scheduler, model, denoiser, and initial latents."""
+    """Create scheduler, model, denoiser, and initial latents.
+
+    With ``guidance_config`` set, the model is wrapped in a DPSScorePredictor
+    with a DPS guidance and the denoiser uses the score path; otherwise the
+    denoiser uses ``predictor_type`` (x0 / score / epsilon).
+    """
     scheduler = sched_cls(**sched_kwargs)
     model = instantiate_model_deterministic(
         predictor_cls,
         seed=seed,
         **predictor_kwargs,
     ).to(device)
-    if predictor_type == "score":
+    if guidance_config is not None:
+        if guidance_config == "data_l2":
+            mask = torch.zeros(shape, dtype=torch.bool, device=device)
+            flat = mask.view(shape[0], -1)
+            flat[:, 0] = True
+            flat[:, flat.shape[1] // 2] = True
+            y = make_input(shape, seed=300, device=device)
+            guidance = DataConsistencyDPSGuidance(
+                mask=mask,
+                y=y,
+                std_y=0.1,
+                create_graph=create_graph,
+                retain_graph=retain_graph,
+            )
+        elif guidance_config == "model_l2_sda":
+            obs_shape = (shape[0], 1, *shape[2:])
+            y = make_input(obs_shape, seed=300, device=device)
+            guidance = ModelConsistencyDPSGuidance(
+                observation_operator=lambda xx: xx[:, :1],
+                y=y,
+                std_y=0.1,
+                gamma=0.5,
+                sigma_fn=scheduler.sigma,
+                alpha_fn=scheduler.alpha,
+                create_graph=create_graph,
+                retain_graph=retain_graph,
+            )
+        else:
+            raise ValueError(f"Unknown guidance config: {guidance_config}")
+        dps = DPSScorePredictor(
+            x0_predictor=model,
+            x0_to_score_fn=scheduler.x0_to_score,
+            guidances=guidance,
+        )
+        denoiser = scheduler.get_denoiser(score_predictor=dps, denoising_type="ode")
+    elif predictor_type == "score":
         denoiser = scheduler.get_denoiser(score_predictor=model, denoising_type="ode")
     elif predictor_type == "epsilon":
         denoiser = scheduler.get_denoiser(epsilon_predictor=model, denoising_type="ode")
@@ -140,11 +252,34 @@ def _make_sampling_components(
     return scheduler, model, denoiser, xN
 
 
-def _make_solver_arg(solver_key, solver_options, denoiser):
-    """Build the solver argument for sample() from config fields."""
+def _make_solver_arg(
+    solver_key,
+    solver_options,
+    denoiser,
+    scheduler=None,
+    predictor_type="x0",
+):
+    """Build the solver argument for sample() from config fields, resolving
+    the "_use_*" sentinels with the scheduler of the test."""
     if solver_key == "_custom_euler":
         return _CustomEulerSolver(denoiser), None
-    return solver_key, solver_options or None
+    opts = dict(solver_options) if solver_options else {}
+    if opts.pop("_use_sigma_fns", False):
+        opts["sigma_fn"] = scheduler.sigma
+        opts["sigma_inv_fn"] = scheduler.sigma_inv
+        opts["alpha_fn"] = scheduler.alpha
+    if opts.pop("_use_linear_fn", False):
+        # The affine callbacks follow the parameterization of the denoiser
+        (
+            opts["bias_fn"],
+            opts["bias_int_fn"],
+            slope_fn,
+        ) = scheduler.get_linear_denoiser(prediction_type=predictor_type)
+        if opts.pop("_use_slope_fn", False):
+            opts["slope_fn"] = slope_fn
+    if opts.pop("_use_log_snr_lambda", False):
+        opts["lambda_fn"] = lambda t: torch.log(scheduler.snr(t))
+    return solver_key, opts or None
 
 
 # =============================================================================
@@ -152,12 +287,6 @@ def _make_solver_arg(solver_key, solver_options, denoiser):
 # =============================================================================
 
 
-@pytest.mark.parametrize("predictor_type", PREDICTOR_TYPES, ids=PREDICTOR_TYPES)
-@pytest.mark.parametrize(
-    "solver_key,solver_options,sampler_name,uses_rng",
-    SAMPLER_CONFIGS,
-    ids=[c[2] for c in SAMPLER_CONFIGS],
-)
 @pytest.mark.parametrize(
     "sched_cls,sched_kwargs,sched_name",
     SCHEDULER_CONFIGS,
@@ -169,27 +298,33 @@ def _make_solver_arg(solver_key, solver_options, denoiser):
     ids=[c[0] for c in SPATIAL_CONFIGS],
 )
 class TestSampleNonRegression:
-    """Non-regression tests for sample() across all sampler configs."""
+    """Non-regression tests for sample() (plain and guided)."""
 
+    @pytest.mark.parametrize("predictor_type", PREDICTOR_TYPES, ids=PREDICTOR_TYPES)
+    @pytest.mark.parametrize(
+        "solver_key,solver_options,sampler_name,uses_rng",
+        SAMPLER_CONFIGS,
+        ids=[c[2] for c in SAMPLER_CONFIGS],
+    )
     def test_sample(
         self,
         deterministic_settings,
         device,
         tolerances,
+        spatial_name,
+        shape,
+        predictor_cls,
+        predictor_kwargs,
+        sched_cls,
+        sched_kwargs,
+        sched_name,
         predictor_type,
         solver_key,
         solver_options,
         sampler_name,
         uses_rng,
-        sched_cls,
-        sched_kwargs,
-        sched_name,
-        spatial_name,
-        shape,
-        predictor_cls,
-        predictor_kwargs,
     ):
-        scheduler, _, denoiser, xN = _make_sampling_components(
+        scheduler, model, denoiser, xN = _make_sampling_components(
             sched_cls,
             sched_kwargs,
             shape,
@@ -198,7 +333,13 @@ class TestSampleNonRegression:
             device,
             predictor_type=predictor_type,
         )
-        solver_arg, opts = _make_solver_arg(solver_key, solver_options, denoiser)
+        solver_arg, opts = _make_solver_arg(
+            solver_key,
+            solver_options,
+            denoiser,
+            scheduler=scheduler,
+            predictor_type=predictor_type,
+        )
 
         if "cuda" in str(device) and uses_rng:
 
@@ -212,7 +353,12 @@ class TestSampleNonRegression:
                     solver_options=opts,
                 )
 
-            result = gpu_rng_roundtrip(fn, GLOBAL_SEED, str(device))
+            result = gpu_rng_roundtrip(
+                fn,
+                GLOBAL_SEED,
+                str(device),
+                **SAMPLER_RNG_TOLERANCES.get(sampler_name, {}),
+            )
             assert result.shape == shape
         elif "cuda" in str(device) or uses_rng:
             x0 = sample(
@@ -240,25 +386,31 @@ class TestSampleNonRegression:
             ref = load_or_create_reference(ref_file, lambda: {"x0": x0.cpu()})
             compare_outputs(x0, ref["x0"], **SAMPLER_CPU_TOLERANCES)
 
+    @pytest.mark.parametrize("predictor_type", PREDICTOR_TYPES, ids=PREDICTOR_TYPES)
+    @pytest.mark.parametrize(
+        "solver_key,solver_options,sampler_name,uses_rng",
+        SAMPLER_CONFIGS,
+        ids=[c[2] for c in SAMPLER_CONFIGS],
+    )
     def test_sample_with_time_eval(
         self,
         deterministic_settings,
         device,
         tolerances,
+        spatial_name,
+        shape,
+        predictor_cls,
+        predictor_kwargs,
+        sched_cls,
+        sched_kwargs,
+        sched_name,
         predictor_type,
         solver_key,
         solver_options,
         sampler_name,
         uses_rng,
-        sched_cls,
-        sched_kwargs,
-        sched_name,
-        spatial_name,
-        shape,
-        predictor_cls,
-        predictor_kwargs,
     ):
-        scheduler, _, denoiser, xN = _make_sampling_components(
+        scheduler, model, denoiser, xN = _make_sampling_components(
             sched_cls,
             sched_kwargs,
             shape,
@@ -267,7 +419,13 @@ class TestSampleNonRegression:
             device,
             predictor_type=predictor_type,
         )
-        solver_arg, opts = _make_solver_arg(solver_key, solver_options, denoiser)
+        solver_arg, opts = _make_solver_arg(
+            solver_key,
+            solver_options,
+            denoiser,
+            scheduler=scheduler,
+            predictor_type=predictor_type,
+        )
 
         if "cuda" in str(device) and uses_rng:
 
@@ -283,7 +441,12 @@ class TestSampleNonRegression:
                 )
                 return torch.stack(results)
 
-            stacked = gpu_rng_roundtrip(fn, GLOBAL_SEED, str(device))
+            stacked = gpu_rng_roundtrip(
+                fn,
+                GLOBAL_SEED,
+                str(device),
+                **SAMPLER_RNG_TOLERANCES.get(sampler_name, {}),
+            )
             assert stacked.shape == (len(TIME_EVAL_INDICES), *shape)
         elif "cuda" in str(device) or uses_rng:
             results = sample(
@@ -314,6 +477,43 @@ class TestSampleNonRegression:
             ref_file = f"{REF_PREFIX}{sampler_name}_{sched_name}_{spatial_name}_{predictor_type}pred_teval.pth"
             ref = load_or_create_reference(ref_file, lambda: {"stacked": stacked.cpu()})
             compare_outputs(stacked, ref["stacked"], **SAMPLER_CPU_TOLERANCES)
+
+    @pytest.mark.parametrize("guidance_config", GUIDANCE_CONFIGS, ids=GUIDANCE_CONFIGS)
+    def test_guided_sample(
+        self,
+        deterministic_settings,
+        device,
+        tolerances,
+        spatial_name,
+        shape,
+        predictor_cls,
+        predictor_kwargs,
+        sched_cls,
+        sched_kwargs,
+        sched_name,
+        guidance_config,
+    ):
+        scheduler, _, denoiser, xN = _make_sampling_components(
+            sched_cls,
+            sched_kwargs,
+            shape,
+            predictor_cls,
+            predictor_kwargs,
+            device,
+            guidance_config=guidance_config,
+        )
+
+        x0 = sample(denoiser, xN, scheduler, NUM_STEPS, solver="euler")
+
+        assert x0.shape == shape
+        assert torch.isfinite(x0).all()
+
+        if "cuda" not in str(device):
+            ref_file = (
+                f"{REF_PREFIX}guided_{spatial_name}_{sched_name}_{guidance_config}.pth"
+            )
+            ref = load_or_create_reference(ref_file, lambda: {"x0": x0.cpu()})
+            compare_outputs(x0, ref["x0"], **SAMPLER_CPU_TOLERANCES)
 
 
 # =============================================================================
@@ -364,19 +564,10 @@ class TestSampleConsistency:
         t_steps = scheduler.timesteps(NUM_STEPS_SHORT, device=device, dtype=xN.dtype)
 
         x0_via_num_steps = sample(
-            denoiser,
-            xN,
-            scheduler,
-            NUM_STEPS_SHORT,
-            solver="euler",
+            denoiser, xN, scheduler, NUM_STEPS_SHORT, solver="euler"
         )
         x0_via_time_steps = sample(
-            denoiser,
-            xN,
-            scheduler,
-            num_steps=0,
-            time_steps=t_steps,
-            solver="euler",
+            denoiser, xN, scheduler, num_steps=0, time_steps=t_steps, solver="euler"
         )
         compare_outputs(x0_via_time_steps, x0_via_num_steps, atol=1e-6, rtol=1e-6)
 
@@ -406,19 +597,9 @@ class TestSampleConsistency:
             predictor_type=predictor_type,
         )
 
-        x0_via_string = sample(
-            denoiser,
-            xN,
-            scheduler,
-            NUM_STEPS_SHORT,
-            solver="euler",
-        )
+        x0_via_string = sample(denoiser, xN, scheduler, NUM_STEPS_SHORT, solver="euler")
         x0_via_instance = sample(
-            denoiser,
-            xN,
-            scheduler,
-            NUM_STEPS_SHORT,
-            solver=EulerSolver(denoiser),
+            denoiser, xN, scheduler, NUM_STEPS_SHORT, solver=EulerSolver(denoiser)
         )
         compare_outputs(x0_via_instance, x0_via_string, atol=1e-6, rtol=1e-6)
 
@@ -492,13 +673,7 @@ class TestSampleConsistency:
             predictor_type=predictor_type,
         )
 
-        x0_builtin = sample(
-            denoiser,
-            xN,
-            scheduler,
-            NUM_STEPS_SHORT,
-            solver="euler",
-        )
+        x0_builtin = sample(denoiser, xN, scheduler, NUM_STEPS_SHORT, solver="euler")
         x0_custom = sample(
             denoiser,
             xN,
@@ -520,12 +695,7 @@ class TestSampleValidation:
     def test_solver_options_with_instance_raises(self, device):
         shape = (BATCH, 3, 8, 6)
         scheduler, _, denoiser, xN = _make_sampling_components(
-            EDMNoiseScheduler,
-            {},
-            shape,
-            Conv2dX0Predictor,
-            {"channels": 3},
-            device,
+            EDMNoiseScheduler, {}, shape, Conv2dX0Predictor, {"channels": 3}, device
         )
         with pytest.raises(ValueError, match="solver_options"):
             sample(
@@ -537,15 +707,25 @@ class TestSampleValidation:
                 solver_options={"alpha": 0.5},
             )
 
+    def test_none_callback_options_warn(self, device):
+        shape = (BATCH, 3, 8, 6)
+        scheduler, _, denoiser, xN = _make_sampling_components(
+            EDMNoiseScheduler, {}, shape, Conv2dX0Predictor, {"channels": 3}, device
+        )
+        with pytest.warns(UserWarning, match="selected without callback options"):
+            sample(
+                denoiser,
+                xN,
+                scheduler,
+                NUM_STEPS,
+                solver="exponential_euler",
+                solver_options={"bias_fn": None, "slope_fn": None},
+            )
+
     def test_unknown_solver_string_raises(self, device):
         shape = (BATCH, 3, 8, 6)
         scheduler, _, denoiser, xN = _make_sampling_components(
-            EDMNoiseScheduler,
-            {},
-            shape,
-            Conv2dX0Predictor,
-            {"channels": 3},
-            device,
+            EDMNoiseScheduler, {}, shape, Conv2dX0Predictor, {"channels": 3}, device
         )
         with pytest.raises(ValueError, match="Unknown solver"):
             sample(denoiser, xN, scheduler, NUM_STEPS, solver="nonexistent")
@@ -556,12 +736,7 @@ class TestSampleValidation:
 # =============================================================================
 
 
-@pytest.mark.parametrize("predictor_type", PREDICTOR_TYPES, ids=PREDICTOR_TYPES)
-@pytest.mark.parametrize(
-    "solver_key,solver_options,sampler_name,uses_rng",
-    SAMPLER_CONFIGS,
-    ids=[c[2] for c in SAMPLER_CONFIGS],
-)
+@pytest.mark.usefixtures("nop_compile")
 @pytest.mark.parametrize(
     "sched_cls,sched_kwargs,sched_name",
     SCHEDULER_CONFIGS,
@@ -572,35 +747,36 @@ class TestSampleValidation:
     SPATIAL_CONFIGS,
     ids=[c[0] for c in SPATIAL_CONFIGS],
 )
-@pytest.mark.usefixtures("nop_compile")
 class TestSampleCompile:
-    """torch.compile tests: compiled denoiser passed to sample()."""
+    """torch.compile tests: compiled denoiser passed to sample() (plain and guided)."""
 
+    @pytest.mark.parametrize("predictor_type", PREDICTOR_TYPES, ids=PREDICTOR_TYPES)
+    @pytest.mark.parametrize(
+        "solver_key,solver_options,sampler_name,uses_rng",
+        SAMPLER_CONFIGS,
+        ids=[c[2] for c in SAMPLER_CONFIGS],
+    )
     def test_compiled_denoiser_in_sample(
         self,
         deterministic_settings,
         device,
+        spatial_name,
+        shape,
+        predictor_cls,
+        predictor_kwargs,
+        sched_cls,
+        sched_kwargs,
+        sched_name,
         predictor_type,
         solver_key,
         solver_options,
         sampler_name,
         uses_rng,
-        sched_cls,
-        sched_kwargs,
-        sched_name,
-        spatial_name,
-        shape,
-        predictor_cls,
-        predictor_kwargs,
     ):
-        """Sampling with a compiled denoiser matches eager sampling.
-
-        Also makes a second compiled call to verify the graph is reused,
-        with error_on_recompile to catch unexpected graph breaks.
-        """
+        """Sampling with a compiled denoiser matches eager; graph reused on 2nd call."""
         torch._dynamo.config.error_on_recompile = True
 
-        scheduler, _, denoiser, xN = _make_sampling_components(
+        scheduler, model, denoiser, xN = _make_sampling_components(
             sched_cls,
             sched_kwargs,
             shape,
@@ -616,11 +792,15 @@ class TestSampleCompile:
             solver_key,
             solver_options,
             denoiser,
+            scheduler=scheduler,
+            predictor_type=predictor_type,
         )
         solver_compiled, opts_compiled = _make_solver_arg(
             solver_key,
             solver_options,
             compiled_denoiser,
+            scheduler=scheduler,
+            predictor_type=predictor_type,
         )
 
         with torch.no_grad():
@@ -648,7 +828,6 @@ class TestSampleCompile:
             )
         torch.testing.assert_close(x0_eager, x0_compiled, atol=0.5, rtol=0.3)
 
-        # Second compiled call — must reuse the graph (error_on_recompile guards this)
         with torch.no_grad():
             torch.manual_seed(GLOBAL_SEED)
             if "cuda" in str(device):
@@ -663,18 +842,59 @@ class TestSampleCompile:
             )
         torch.testing.assert_close(x0_compiled, x0_compiled_2, atol=0.5, rtol=0.3)
 
+    @pytest.mark.parametrize("guidance_config", GUIDANCE_CONFIGS, ids=GUIDANCE_CONFIGS)
+    def test_compiled_guided_denoiser_in_sample(
+        self,
+        deterministic_settings,
+        device,
+        spatial_name,
+        shape,
+        predictor_cls,
+        predictor_kwargs,
+        sched_cls,
+        sched_kwargs,
+        sched_name,
+        guidance_config,
+    ):
+        """Compiled guided (DPS) denoiser matches eager; graph reused on 2nd call.
+
+        fullgraph=False because the guidance computes an internal autograd.grad
+        (a graph break) inside the denoiser.
+        """
+        torch._dynamo.config.error_on_recompile = True
+
+        scheduler, _, denoiser, xN = _make_sampling_components(
+            sched_cls,
+            sched_kwargs,
+            shape,
+            predictor_cls,
+            predictor_kwargs,
+            device,
+            num_steps=NUM_STEPS_SHORT,
+            guidance_config=guidance_config,
+        )
+        compiled_denoiser = torch.compile(denoiser)
+
+        with torch.no_grad():
+            x0_eager = sample(denoiser, xN, scheduler, NUM_STEPS_SHORT, solver="euler")
+            x0_compiled = sample(
+                compiled_denoiser, xN, scheduler, NUM_STEPS_SHORT, solver="euler"
+            )
+        torch.testing.assert_close(x0_eager, x0_compiled, atol=0.5, rtol=0.3)
+
+        with torch.no_grad():
+            x0_compiled_2 = sample(
+                compiled_denoiser, xN, scheduler, NUM_STEPS_SHORT, solver="euler"
+            )
+        torch.testing.assert_close(x0_compiled, x0_compiled_2, atol=0.5, rtol=0.3)
+
 
 # =============================================================================
 # Full Sampler Compile Tests
 # =============================================================================
 
 
-@pytest.mark.parametrize("predictor_type", PREDICTOR_TYPES, ids=PREDICTOR_TYPES)
-@pytest.mark.parametrize(
-    "solver_key,solver_options,sampler_name,uses_rng",
-    SAMPLER_CONFIGS,
-    ids=[c[2] for c in SAMPLER_CONFIGS],
-)
+@pytest.mark.usefixtures("nop_compile")
 @pytest.mark.parametrize(
     "sched_cls,sched_kwargs,sched_name",
     SCHEDULER_CONFIGS,
@@ -685,26 +905,31 @@ class TestSampleCompile:
     SPATIAL_CONFIGS,
     ids=[c[0] for c in SPATIAL_CONFIGS],
 )
-@pytest.mark.usefixtures("nop_compile")
 class TestFullSamplerCompile:
-    """Compile the entire sample() call and verify double-call graph reuse."""
+    """Compile the entire sample() call (plain and guided)."""
 
+    @pytest.mark.parametrize("predictor_type", PREDICTOR_TYPES, ids=PREDICTOR_TYPES)
+    @pytest.mark.parametrize(
+        "solver_key,solver_options,sampler_name,uses_rng",
+        SAMPLER_CONFIGS,
+        ids=[c[2] for c in SAMPLER_CONFIGS],
+    )
     def test_compiled_sample(
         self,
         deterministic_settings,
         device,
+        spatial_name,
+        shape,
+        predictor_cls,
+        predictor_kwargs,
+        sched_cls,
+        sched_kwargs,
+        sched_name,
         predictor_type,
         solver_key,
         solver_options,
         sampler_name,
         uses_rng,
-        sched_cls,
-        sched_kwargs,
-        sched_name,
-        spatial_name,
-        shape,
-        predictor_cls,
-        predictor_kwargs,
     ):
         """torch.compile(sample(...)) traces and graph is reused on second call."""
         torch._dynamo.config.error_on_recompile = True
@@ -720,10 +945,18 @@ class TestFullSamplerCompile:
             predictor_type=predictor_type,
         )
 
-        # _custom_euler uses an instance, not a string — skip it here since
-        # we test string-based solver dispatch through compile.
+        # Custom solver instances are exercised in TestSampleCompile; here we
+        # test string-based solver dispatch through compile.
         if solver_key == "_custom_euler":
             pytest.skip("Custom solver instances are tested in TestSampleCompile")
+
+        solver_arg, opts = _make_solver_arg(
+            solver_key,
+            solver_options,
+            denoiser,
+            scheduler=scheduler,
+            predictor_type=predictor_type,
+        )
 
         def do_sample(x):
             return sample(
@@ -731,8 +964,8 @@ class TestFullSamplerCompile:
                 x,
                 scheduler,
                 NUM_STEPS_SHORT,
-                solver=solver_key,
-                solver_options=solver_options or None,
+                solver=solver_arg,
+                solver_options=opts,
             )
 
         compiled_sample = torch.compile(do_sample, fullgraph=True)
@@ -742,17 +975,63 @@ class TestFullSamplerCompile:
         assert x0_compiled.shape == shape
         assert torch.isfinite(x0_compiled).all()
 
-        # Second call — must reuse the graph
         with torch.no_grad():
             x0_compiled_2 = compiled_sample(xN)
         assert x0_compiled_2.shape == shape
         assert torch.isfinite(x0_compiled_2).all()
 
-        # For deterministic solvers, also verify eager-vs-compiled match
         if not uses_rng:
             with torch.no_grad():
                 x0_eager = do_sample(xN)
             torch.testing.assert_close(x0_eager, x0_compiled, atol=2.0, rtol=2.0)
+
+    @pytest.mark.parametrize("guidance_config", GUIDANCE_CONFIGS, ids=GUIDANCE_CONFIGS)
+    def test_compiled_guided_sample(
+        self,
+        deterministic_settings,
+        device,
+        spatial_name,
+        shape,
+        predictor_cls,
+        predictor_kwargs,
+        sched_cls,
+        sched_kwargs,
+        sched_name,
+        guidance_config,
+    ):
+        """Guided: torch.compile(sample(...)) over the DPS path traces and reuses
+        the graph. fullgraph=False because the guidance computes an internal
+        autograd.grad inside the denoiser."""
+        torch._dynamo.config.error_on_recompile = True
+
+        scheduler, _, denoiser, xN = _make_sampling_components(
+            sched_cls,
+            sched_kwargs,
+            shape,
+            predictor_cls,
+            predictor_kwargs,
+            device,
+            num_steps=NUM_STEPS_SHORT,
+            guidance_config=guidance_config,
+        )
+
+        def do_sample(x):
+            return sample(denoiser, x, scheduler, NUM_STEPS_SHORT, solver="euler")
+
+        compiled_sample = torch.compile(do_sample)
+
+        with torch.no_grad():
+            x0_compiled = compiled_sample(xN)
+        assert x0_compiled.shape == shape
+        assert torch.isfinite(x0_compiled).all()
+
+        with torch.no_grad():
+            x0_compiled_2 = compiled_sample(xN)
+        torch.testing.assert_close(x0_compiled, x0_compiled_2, atol=0.5, rtol=0.3)
+
+        with torch.no_grad():
+            x0_eager = do_sample(xN)
+        torch.testing.assert_close(x0_eager, x0_compiled, atol=2.0, rtol=2.0)
 
 
 # =============================================================================
@@ -760,12 +1039,6 @@ class TestFullSamplerCompile:
 # =============================================================================
 
 
-@pytest.mark.parametrize("predictor_type", PREDICTOR_TYPES, ids=PREDICTOR_TYPES)
-@pytest.mark.parametrize(
-    "solver_key,solver_options,sampler_name,uses_rng",
-    SAMPLER_CONFIGS,
-    ids=[c[2] for c in SAMPLER_CONFIGS],
-)
 @pytest.mark.parametrize(
     "sched_cls,sched_kwargs,sched_name",
     SCHEDULER_CONFIGS,
@@ -777,23 +1050,29 @@ class TestFullSamplerCompile:
     ids=[c[0] for c in SPATIAL_CONFIGS],
 )
 class TestGradientFlow:
-    """Tests that gradients flow through the sampling loop to model parameters."""
+    """Gradients flow through the sampling loop to model parameters (plain and guided)."""
 
+    @pytest.mark.parametrize("predictor_type", PREDICTOR_TYPES, ids=PREDICTOR_TYPES)
+    @pytest.mark.parametrize(
+        "solver_key,solver_options,sampler_name,uses_rng",
+        SAMPLER_CONFIGS,
+        ids=[c[2] for c in SAMPLER_CONFIGS],
+    )
     def test_backward_through_sampling(
         self,
         device,
+        spatial_name,
+        shape,
+        predictor_cls,
+        predictor_kwargs,
+        sched_cls,
+        sched_kwargs,
+        sched_name,
         predictor_type,
         solver_key,
         solver_options,
         sampler_name,
         uses_rng,
-        sched_cls,
-        sched_kwargs,
-        sched_name,
-        spatial_name,
-        shape,
-        predictor_cls,
-        predictor_kwargs,
     ):
         scheduler, model, denoiser, xN = _make_sampling_components(
             sched_cls,
@@ -802,21 +1081,158 @@ class TestGradientFlow:
             predictor_cls,
             predictor_kwargs,
             device,
-            num_steps=NUM_STEPS_SHORT,
+            num_steps=NUM_STEPS_GRAD,
             predictor_type=predictor_type,
         )
-        solver_arg, opts = _make_solver_arg(solver_key, solver_options, denoiser)
+        solver_arg, opts = _make_solver_arg(
+            solver_key,
+            solver_options,
+            denoiser,
+            scheduler=scheduler,
+            predictor_type=predictor_type,
+        )
 
         x0 = sample(
             denoiser,
             xN,
             scheduler,
-            NUM_STEPS_SHORT,
+            NUM_STEPS_GRAD,
             solver=solver_arg,
             solver_options=opts,
         )
-        loss = x0.sum()
-        loss.backward()
+        x0.sum().backward()
+
+        for name, param in model.named_parameters():
+            assert param.grad is not None, f"{name} has no gradient"
+            assert torch.isfinite(param.grad).all(), f"{name} has a non-finite gradient"
+            assert torch.count_nonzero(param.grad) > 0, (
+                f"{name} has only zero gradients"
+            )
+
+    @pytest.mark.parametrize("predictor_type", PREDICTOR_TYPES, ids=PREDICTOR_TYPES)
+    @pytest.mark.parametrize(
+        "solver_key,solver_options,sampler_name,uses_rng",
+        SAMPLER_CONFIGS,
+        ids=[c[2] for c in SAMPLER_CONFIGS],
+    )
+    def test_input_gradient_flow(
+        self,
+        deterministic_settings,
+        device,
+        spatial_name,
+        shape,
+        predictor_cls,
+        predictor_kwargs,
+        sched_cls,
+        sched_kwargs,
+        sched_name,
+        predictor_type,
+        solver_key,
+        solver_options,
+        sampler_name,
+        uses_rng,
+    ):
+        scheduler, model, denoiser, xN = _make_sampling_components(
+            sched_cls,
+            sched_kwargs,
+            shape,
+            predictor_cls,
+            predictor_kwargs,
+            device,
+            num_steps=NUM_STEPS_GRAD,
+            predictor_type=predictor_type,
+        )
+        xN = xN.detach().requires_grad_()
+        time_steps = (
+            scheduler.timesteps(
+                NUM_STEPS_GRAD + 1,
+                device=device,
+                dtype=xN.dtype,
+            )[:-1]
+            .detach()
+            .requires_grad_()
+        )
+        if solver_key == "_custom_euler":
+            solver_arg = _CustomEulerSolver(denoiser)
+            opts = None
+            option_leaves = {}
+            nonzero_option_names = set()
+        else:
+            solver_arg = solver_key
+            opts, option_leaves, nonzero_option_names = (
+                make_differentiable_solver_options(
+                    sampler_name,
+                    solver_options,
+                    scheduler,
+                    predictor_type,
+                    device,
+                )
+            )
+
+        x0 = sample(
+            denoiser,
+            xN,
+            scheduler,
+            NUM_STEPS_GRAD,
+            solver=solver_arg,
+            solver_options=opts,
+            time_steps=time_steps,
+        )
+        x0.square().mean().backward()
+
+        assert xN.grad is not None
+        assert torch.isfinite(xN.grad).all()
+        assert torch.count_nonzero(xN.grad) == xN.grad.numel()
+
+        assert time_steps.grad is not None
+        assert torch.isfinite(time_steps.grad).all()
+        assert torch.count_nonzero(time_steps.grad) == time_steps.grad.numel()
+
+        for name, parameter in model.named_parameters():
+            assert parameter.grad is not None, f"{name} has no gradient"
+            assert torch.isfinite(parameter.grad).all(), (
+                f"{name} has a non-finite gradient"
+            )
+            assert torch.count_nonzero(parameter.grad) == parameter.grad.numel(), (
+                f"{name} contains zero gradients"
+            )
+
+        for name, option in option_leaves.items():
+            assert option.grad is not None, f"{name} has no gradient"
+            assert torch.isfinite(option.grad), f"{name} has a non-finite gradient"
+            if name in nonzero_option_names:
+                assert option.grad != 0, f"{name} has a zero gradient"
+
+    @pytest.mark.parametrize("guidance_config", GUIDANCE_CONFIGS, ids=GUIDANCE_CONFIGS)
+    def test_backward_through_guided_sampling(
+        self,
+        device,
+        spatial_name,
+        shape,
+        predictor_cls,
+        predictor_kwargs,
+        sched_cls,
+        sched_kwargs,
+        sched_name,
+        guidance_config,
+    ):
+        # create_graph/retain_graph let the post-sample backward traverse the
+        # per-step autograd.grad graph the guidance builds.
+        scheduler, model, denoiser, xN = _make_sampling_components(
+            sched_cls,
+            sched_kwargs,
+            shape,
+            predictor_cls,
+            predictor_kwargs,
+            device,
+            num_steps=NUM_STEPS_SHORT,
+            guidance_config=guidance_config,
+            create_graph=True,
+            retain_graph=True,
+        )
+
+        x0 = sample(denoiser, xN, scheduler, NUM_STEPS_SHORT, solver="euler")
+        x0.sum().backward()
 
         has_grad = any(
             p.grad is not None and not torch.isnan(p.grad).any()

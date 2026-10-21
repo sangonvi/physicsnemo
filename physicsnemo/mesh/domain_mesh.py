@@ -15,14 +15,20 @@
 # limitations under the License.
 
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 import torch
-from jaxtyping import Float
-from tensordict import TensorDict, tensorclass
+from jaxtyping import Bool, Float
+from tensordict import TensorClass, TensorDict
 
-from physicsnemo.mesh.mesh import Mesh
+from physicsnemo.mesh.mesh import (
+    Mesh,
+    _requested_dtype,
+    _set_subclass_fields,
+)
+from physicsnemo.mesh.transformations.deform.ffd import _FFDBasis
 from physicsnemo.mesh.utilities.mesh_repr import format_mesh_repr
 
 if TYPE_CHECKING:
@@ -30,8 +36,21 @@ if TYPE_CHECKING:
     import pyvista
 
 
-@tensorclass
-class DomainMesh:
+class _DomainMeshTensorClassMeta(type(TensorClass)):
+    """Keep ``DomainMesh`` unsubscriptable, as it was under ``@tensorclass``.
+
+    ``TensorClass`` subscripts its subclasses to select configuration
+    (``TensorClass["nocast"]``), so without this a mistaken annotation such as
+    ``DomainMesh["wall"]`` would quietly evaluate to an unrelated class instead
+    of raising. ``Mesh`` claims the same syntax for dimension specialization
+    (see ``_MeshTensorClassMeta``); ``DomainMesh`` has no such parametrization.
+    """
+
+    def __getitem__(cls, params: Any) -> type:
+        raise TypeError(f"type '{cls.__name__}' is not subscriptable")
+
+
+class DomainMesh(TensorClass, metaclass=_DomainMeshTensorClassMeta):
     r"""A simulation domain represented as an interior mesh with named boundary meshes.
 
     A ``DomainMesh`` groups an interior :class:`Mesh` (either a volumetric mesh
@@ -39,6 +58,12 @@ class DomainMesh:
     :class:`Mesh` objects keyed by boundary condition type (e.g. ``"no_slip"``,
     ``"inlet"``, ``"farfield"``), plus optional domain-level metadata in
     ``global_data``.
+
+    ``DomainMesh`` exposes sparse world-space :meth:`morph`, global
+    :meth:`radial_basis_function_deform`, and lattice
+    :meth:`free_form_deform`, but no dense ``displace``. Component point counts
+    and fields can differ. One shared control field transfers consistently
+    across every component.
 
     The semantic contract is that the boundary meshes, if merged, form a
     watertight enclosure around the interior mesh. This is documented but not
@@ -63,12 +88,16 @@ class DomainMesh:
         Reynolds number, angle of attack, Mach number). If a ``dict`` is
         provided, it is automatically converted to a :class:`TensorDict`.
         Defaults to an empty collection.
+    **fields
+        Values for the fields that a subclass of ``DomainMesh`` declares, so
+        that such a subclass needs no ``__init__`` of its own.
 
     Raises
     ------
     TypeError
-        If ``interior`` is not a :class:`Mesh`, or if any value in
-        ``boundaries`` is not a :class:`Mesh`.
+        If ``interior`` is not a :class:`Mesh`, if any value in
+        ``boundaries`` is not a :class:`Mesh`, or if a keyword argument names
+        no field of the class.
     ValueError
         If any boundary mesh has a different ``n_spatial_dims`` than
         ``interior``.
@@ -110,18 +139,21 @@ class DomainMesh:
     """
 
     interior: Mesh
-    boundaries: TensorDict[str, Mesh]
-    global_data: TensorDict
+    boundaries: TensorDict[str, Mesh] = None  # type: ignore[assignment]
+    global_data: TensorDict = None  # type: ignore[assignment]
 
     def __init__(
         self,
         interior: Mesh,
         boundaries: dict[str, Mesh] | TensorDict | None = None,
         global_data: dict[str, torch.Tensor] | TensorDict | None = None,
+        **fields: Any,
     ) -> None:
         self.interior = interior
         self.boundaries = boundaries  # normalized by __post_init__
         self.global_data = global_data  # normalized by __post_init__
+        if fields:
+            _set_subclass_fields(self, DomainMesh, fields)
         # tensorclass only auto-calls __post_init__ from the *generated* __init__
         # (same semantics as dataclasses). Since we define a custom __init__,
         # we must call it explicitly. During load(), tensorclass calls it
@@ -141,12 +173,13 @@ class DomainMesh:
             self.boundaries = TensorDict(self.boundaries, batch_size=[])
         elif self.boundaries is None:
             self.boundaries = TensorDict({}, batch_size=[])
-        else:
+        elif self.boundaries.batch_size:
             self.boundaries.batch_size = torch.Size([])
 
         ### global_data: coerce dict -> TensorDict, None -> empty TensorDict
         if isinstance(self.global_data, TensorDict):
-            self.global_data.batch_size = torch.Size([])
+            if self.global_data.batch_size:
+                self.global_data.batch_size = torch.Size([])
         else:
             self.global_data = TensorDict(
                 {} if self.global_data is None else dict(self.global_data),
@@ -222,7 +255,8 @@ class DomainMesh:
         ...     lambda m: m.subdivide(levels=1), boundaries=True, interior=False
         ... )
         """
-        return DomainMesh(
+        return replace(
+            self,
             interior=fn(self.interior) if interior else self.interior.clone(),
             boundaries=(
                 self.boundaries.apply(fn, call_on_nested=True)
@@ -232,46 +266,112 @@ class DomainMesh:
             global_data=self.global_data.clone(),
         )
 
+    def __repr__(self) -> str:
+        """Format a readable summary of the domain mesh."""
+        lines = ["DomainMesh("]
+
+        ### Interior - indent data fields one level under "interior:"
+        interior_repr = format_mesh_repr(self.interior)
+        first, *rest = interior_repr.split("\n")
+        lines.append(f"    interior: {first}")
+        lines.extend(f"    {line}" for line in rest)
+
+        ### Boundaries - indent data fields one level under each boundary key
+        bc_names = self.boundary_names
+        if not bc_names:
+            lines.append("    boundaries: {}")
+        else:
+            lines.append("    boundaries:")
+            max_bc_len = max(len(n) for n in bc_names)
+            for name in bc_names:
+                bc_mesh = self.boundaries[name]
+                bc_repr = format_mesh_repr(bc_mesh)
+                first, *rest = bc_repr.split("\n")
+                lines.append(f"        {name.ljust(max_bc_len)}: {first}")
+                lines.extend(f"        {line}" for line in rest)
+
+        ### Global data (only if non-empty); nested leaves print as "a.b: shape"
+        gd_items = sorted(
+            (".".join(k) if isinstance(k, tuple) else k, tuple(v.shape))
+            for k, v in self.global_data.items(include_nested=True, leaves_only=True)
+        )
+        if gd_items:
+            items = ", ".join(f"{k}: {shape}" for k, shape in gd_items)
+            lines.append(f"    global_data: {{{items}}}")
+
+        lines.append(")")
+        return "\n".join(lines)
+
+    def to(self, *args: Any, **kwargs: Any) -> Self:
+        """Move domain and all attached data to specified device/dtype.
+
+        All tensors in ``interior``, every mesh in ``boundaries``, and
+        ``global_data`` are moved together.
+
+        Parameters
+        ----------
+        *args : Any
+            Positional arguments passed to the tensorclass ``to``
+            method.  Common usage: ``dm.to("cuda")`` or
+            ``dm.to(torch.float32)``.
+        **kwargs : Any
+            Keyword arguments passed to the tensorclass ``to`` method.
+
+        Keyword Arguments
+        -----------------
+        device : torch.device, optional
+            The desired device.
+        dtype : torch.dtype, optional
+            The desired floating-point or complex dtype.
+        non_blocking : bool, optional
+            Whether the transfer should be non-blocking.
+
+        Returns
+        -------
+        DomainMesh
+            A new DomainMesh on the target device and dtype. Tensors that
+            need no change are shared with this domain, not copied.
+
+        Raises
+        ------
+        TypeError
+            If ``dtype`` is neither floating-point nor complex. Coordinates
+            must stay real- or complex-valued, and the cast would also be
+            applied to each component mesh's integer ``cells``.
+
+        Examples
+        --------
+        >>> dm_gpu = dm.to("cuda")  # doctest: +SKIP
+        >>> dm_cpu = dm.to(device="cpu")  # doctest: +SKIP
+        """
+        cast_dtype = _requested_dtype(args, kwargs)
+        if cast_dtype is not None and not (
+            cast_dtype.is_floating_point or cast_dtype.is_complex
+        ):
+            raise TypeError(
+                "Mesh coordinates must remain floating point or complex; "
+                f"cannot convert a DomainMesh to {cast_dtype}."
+            )
+        if cast_dtype is None:
+            return super().to(*args, **kwargs)
+
+        # The tensorclass ``to`` would also cast the integer ``cells`` of every
+        # component mesh. Resolve the target device with a zero-length probe, move
+        # all leaves without a dtype conversion, then cast every floating leaf in one
+        # recursive pass. This preserves concrete DomainMesh / Mesh subtypes and their
+        # additional fields.
+        probe = self.interior.points[:0].to(*args, **kwargs)
+        transfer_kwargs = {k: v for k, v in kwargs.items() if k != "dtype"}
+        transfer_kwargs["device"] = probe.device
+        moved = super().to(**transfer_kwargs)
+
+        def _cast(t: torch.Tensor) -> torch.Tensor:
+            return t.to(cast_dtype) if (t.is_floating_point() or t.is_complex()) else t
+
+        return moved.apply(_cast)
+
     if TYPE_CHECKING:
-
-        def to(self, *args: Any, **kwargs: Any) -> Self:
-            """Move domain and all attached data to specified device/dtype.
-
-            All tensors in ``interior``, every mesh in ``boundaries``, and
-            ``global_data`` are moved together.
-
-            Parameters
-            ----------
-            *args : Any
-                Positional arguments passed to the underlying tensorclass
-                ``to`` method.  Common usage: ``dm.to("cuda")`` or
-                ``dm.to(torch.float32)``.
-            **kwargs : Any
-                Keyword arguments passed to the underlying tensorclass
-                ``to`` method.
-
-            Keyword Arguments
-            -----------------
-            device : torch.device, optional
-                The desired device.
-            dtype : torch.dtype, optional
-                The desired floating-point or complex dtype.
-            non_blocking : bool, optional
-                Whether the transfer should be non-blocking.
-
-            Returns
-            -------
-            DomainMesh
-                A new DomainMesh on the target device/dtype, or the same
-                instance if no changes were required.
-
-            Examples
-            --------
-            >>> dm_gpu = dm.to("cuda")  # doctest: +SKIP
-            >>> dm_cpu = dm.to(device="cpu")  # doctest: +SKIP
-            """
-            ...
-
+        # Type stubs for methods that TensorClass adds to the class.
         def clone(self) -> Self:
             """Return a deep clone of this DomainMesh.
 
@@ -398,6 +498,7 @@ class DomainMesh:
         transform_point_data: bool | TensorDict = False,
         transform_cell_data: bool | TensorDict = False,
         transform_global_data: bool | TensorDict = False,
+        assume_valid_axis: bool = False,
     ) -> "DomainMesh":
         r"""Rotate all meshes in the domain about an axis.
 
@@ -423,17 +524,21 @@ class DomainMesh:
         transform_global_data : bool or TensorDict
             Same semantics, for each mesh's ``global_data`` and the
             domain-level :attr:`global_data`.
+        assume_valid_axis : bool, optional
+            Skip the check that ``axis`` has non-zero length.  See
+            :meth:`Mesh.rotate`.
 
         Returns
         -------
         DomainMesh
             New domain with rotated geometry.
         """
+        from physicsnemo.mesh.transformations.geometric import rotation_matrix
+        from physicsnemo.mesh.utilities._device import to_device
+
         if center is not None:
-            c = torch.as_tensor(
-                center,
-                device=self.interior.points.device,
-                dtype=self.interior.points.dtype,
+            c = to_device(
+                center, self.interior.points.device, self.interior.points.dtype
             )
             return (
                 self.translate(-c)
@@ -444,11 +549,10 @@ class DomainMesh:
                     transform_point_data=transform_point_data,
                     transform_cell_data=transform_cell_data,
                     transform_global_data=transform_global_data,
+                    assume_valid_axis=assume_valid_axis,
                 )
                 .translate(c)
             )
-
-        from physicsnemo.mesh.transformations.geometric import rotation_matrix
 
         R = rotation_matrix(
             angle=angle,
@@ -456,6 +560,7 @@ class DomainMesh:
             n_spatial_dims=self.interior.n_spatial_dims,
             device=self.interior.points.device,
             dtype=self.interior.points.dtype,
+            assume_valid_axis=assume_valid_axis,
         )
         return self.transform(
             matrix=R,
@@ -463,6 +568,7 @@ class DomainMesh:
             transform_cell_data=transform_cell_data,
             transform_global_data=transform_global_data,
             assume_invertible=True,
+            assume_similarity=True,
         )
 
     def scale(
@@ -503,11 +609,15 @@ class DomainMesh:
         DomainMesh
             New domain with scaled geometry.
         """
+        from physicsnemo.mesh.transformations.geometric import (
+            _scale_assumptions,
+            scale_matrix,
+        )
+        from physicsnemo.mesh.utilities._device import to_device
+
         if center is not None:
-            c = torch.as_tensor(
-                center,
-                device=self.interior.points.device,
-                dtype=self.interior.points.dtype,
+            c = to_device(
+                center, self.interior.points.device, self.interior.points.dtype
             )
             return (
                 self.translate(-c)
@@ -522,20 +632,24 @@ class DomainMesh:
                 .translate(c)
             )
 
-        from physicsnemo.mesh.transformations.geometric import scale_matrix
-
         M = scale_matrix(
             factor=factor,
             n_spatial_dims=self.interior.n_spatial_dims,
             device=self.interior.points.device,
             dtype=self.interior.points.dtype,
         )
+        is_invertible, is_similarity = _scale_assumptions(
+            factor, self.interior.n_spatial_dims
+        )
         return self.transform(
             matrix=M,
             transform_point_data=transform_point_data,
             transform_cell_data=transform_cell_data,
             transform_global_data=transform_global_data,
-            assume_invertible=assume_invertible,
+            assume_invertible=is_invertible
+            if assume_invertible is None
+            else assume_invertible,
+            assume_similarity=is_similarity,
         )
 
     def transform(
@@ -545,6 +659,7 @@ class DomainMesh:
         transform_cell_data: bool | TensorDict = False,
         transform_global_data: bool | TensorDict = False,
         assume_invertible: bool | None = None,
+        assume_similarity: bool | None = None,
     ) -> "DomainMesh":
         r"""Apply a linear transformation to all meshes in the domain.
 
@@ -567,6 +682,8 @@ class DomainMesh:
             domain-level :attr:`global_data`.
         assume_invertible : bool or None, optional
             Controls cache propagation.  See :meth:`Mesh.transform`.
+        assume_similarity : bool or None, optional
+            Whether ``matrix`` is a similarity.  See :meth:`Mesh.transform`.
 
         Returns
         -------
@@ -580,6 +697,7 @@ class DomainMesh:
                 transform_cell_data=transform_cell_data,
                 transform_global_data=transform_global_data,
                 assume_invertible=assume_invertible,
+                assume_similarity=assume_similarity,
             )
         )
         if transform_global_data is not False:
@@ -596,6 +714,469 @@ class DomainMesh:
                 mask=_normalize_transform_mask(transform_global_data),
             )
         return result
+
+    def morph(
+        self,
+        control_points: torch.Tensor,
+        control_displacements: torch.Tensor,
+        *,
+        radius: float | torch.Tensor,
+        point_weights: str | tuple[str, ...] | None = None,
+        kernel: Literal["wendland_c2"] = "wendland_c2",
+        implementation: Literal["torch", "warp"] | None = None,
+    ) -> "DomainMesh":
+        """Morph the interior and all boundaries with one world-space field.
+
+        The same control coordinates, displacements, radii, and backend are used
+        for every component, so coincident interior/boundary points receive the
+        same motion when ``point_weights`` is ``None``. When supplied,
+        ``point_weights`` is a common :attr:`Mesh.point_data` key (or nested
+        tuple key) resolved on each component independently; raw point-weight
+        tensors are intentionally rejected because component point counts differ.
+        A common key does not require equal values: coincident component points
+        remain coincident only when their resolved point weights also match.
+
+        Parameters
+        ----------
+        control_points : torch.Tensor
+            World-coordinate controls with shape
+            ``(n_controls, n_spatial_dims)`` and the same float32 or float64
+            dtype and device as every component's points.
+        control_displacements : torch.Tensor
+            Displacement vectors, not destination coordinates, with the same
+            shape, dtype, and device as ``control_points``.
+        radius : float or torch.Tensor
+            Support distance in domain coordinate units. Supply a scalar or one
+            radius per control. A tensor radius must match the control dtype and
+            device; every value must remain positive and finite but is not
+            validated at runtime.
+        point_weights : str, tuple[str, ...], or None
+            Optional point-data key present in every component and resolved
+            independently on each component. Resolved tensors must have one
+            common dtype; floating-point weights match the component point dtype.
+            Raw tensors are not accepted.
+        kernel : {"wendland_c2"}, optional
+            Compact radial kernel used to blend control displacements. Default is
+            ``"wendland_c2"``.
+        implementation : {"torch", "warp"} or None
+            Backend override. Auto dispatch uses Torch on CPU and Warp on CUDA
+            when Warp is available, otherwise Torch.
+
+        Returns
+        -------
+        DomainMesh
+            New domain with morphed component meshes and unchanged domain data.
+
+        Notes
+        -----
+        Connectivity and attached mesh and domain data are retained. Attached
+        vector and tensor fields are treated as Lagrangian data and are not
+        pushed forward. Geometry caches are invalidated and topology caches are
+        retained on each component. Parameterize learned radii to remain
+        positive, for example as
+        ``torch.nn.functional.softplus(raw_radius) + eps``. Morphing does not
+        automatically detect inverted, degenerate, or self-intersecting cells.
+        Use each component mesh's :meth:`Mesh.validate` method explicitly when
+        required.
+        """
+        if not isinstance(control_points, torch.Tensor):
+            raise TypeError(
+                "control_points must be a torch.Tensor, got "
+                f"{type(control_points).__name__}"
+            )
+        if not isinstance(control_displacements, torch.Tensor):
+            raise TypeError(
+                "control_displacements must be a torch.Tensor, got "
+                f"{type(control_displacements).__name__}"
+            )
+        if point_weights is not None and not isinstance(point_weights, (str, tuple)):
+            raise TypeError(
+                "DomainMesh.morph point_weights must be a common point_data "
+                "key/path, not a raw tensor"
+            )
+
+        from physicsnemo.mesh.transformations.deform._utils import (
+            _resolve_domain_point_weights,
+        )
+
+        components: list[tuple[str, Mesh]] = [("interior", self.interior)]
+        components.extend(
+            (f"boundaries[{name!r}]", self.boundaries[name])
+            for name in self.boundaries.keys()
+        )
+        resolved_point_weights = _resolve_domain_point_weights(
+            components, point_weights, control_points, "control_points"
+        )
+
+        from physicsnemo.nn.functional.geometry.deform import morph_points
+
+        def apply_field(
+            combined_points: Float[torch.Tensor, "n_points n_spatial_dims"],
+            combined_point_weights: Bool[torch.Tensor, " n_points"]
+            | Float[torch.Tensor, " n_points"]
+            | None,
+        ) -> Float[torch.Tensor, "n_points n_spatial_dims"]:
+            return morph_points(
+                combined_points,
+                control_points,
+                control_displacements,
+                radius=radius,
+                point_weights=combined_point_weights,
+                kernel=kernel,
+                implementation=implementation,
+            )
+
+        return self._deform_components(components, resolved_point_weights, apply_field)
+
+    def radial_basis_function_deform(
+        self,
+        control_points: Float[torch.Tensor, "n_controls n_spatial_dims"],
+        control_displacements: Float[torch.Tensor, "n_controls n_spatial_dims"],
+        *,
+        kernel: Literal["thin_plate_spline"] = "thin_plate_spline",
+        polynomial: bool = True,
+        smoothing: float = 0.0,
+        point_weights: str | tuple[str, ...] | None = None,
+        implementation: Literal["torch", "warp"] | None = None,
+    ) -> "DomainMesh":
+        """Deform every component with one global thin-plate-spline RBF field.
+
+        The same controls, fitted coefficients, kernel, and evaluation backend
+        are shared across the interior and every boundary. With no point
+        weights, coincident component points therefore receive identical
+        motion. When supplied, ``point_weights`` is a common
+        :attr:`Mesh.point_data` key (or nested tuple key) resolved independently
+        on each component. Each resolved weight scales the fitted field at its
+        point. Coincident component points therefore receive identical motion
+        only when their resolved weights match. Raw weight tensors are rejected
+        because component point counts differ.
+
+        Parameters
+        ----------
+        control_points : torch.Tensor
+            World-coordinate controls with shape
+            ``(n_controls, n_spatial_dims)`` and the same float32 or float64
+            dtype and device as every component's points.
+        control_displacements : torch.Tensor
+            Displacement vectors, not destination coordinates, with the same
+            shape, dtype, and device as ``control_points``.
+        kernel : {"thin_plate_spline"}, optional
+            Radial kernel used by the interpolant. Default is
+            ``"thin_plate_spline"``.
+        polynomial : bool, optional
+            Add the standard affine polynomial tail and side constraints. When
+            controls are present, this requires at least ``D + 1`` distinct
+            controls that span the ambient affine basis and form a nonsingular
+            augmented system. Default is ``True``.
+        smoothing : float, optional
+            Nonnegative diagonal regularization. With a nonsingular control
+            layout, zero interpolates the control displacements up to solver
+            precision. Positive values relax interpolation accuracy. Default is
+            ``0.0``.
+        point_weights : str, tuple[str, ...], or None
+            Optional point-data key present in every component. Resolved tensors
+            must use one common bool or floating dtype. Floating weights must
+            match component point dtypes. Every resolved tensor must be on the
+            same device as its component's points. Raw tensors are not
+            accepted.
+        implementation : {"torch", "warp"} or None
+            Field-evaluation backend. Both paths use PyTorch for the coefficient
+            solve. Automatic dispatch uses Torch on CPU. On CUDA, it uses Warp
+            when available and otherwise Torch.
+
+        Returns
+        -------
+        DomainMesh
+            New domain with deformed component meshes and unchanged domain data.
+
+        Raises
+        ------
+        TypeError
+            If control tensors or Python arguments have unsupported types, or
+            if tensor dtypes are unsupported or mismatched.
+        ValueError
+            If component data, tensor shapes, devices, control layout, point
+            weights, or RBF options are invalid.
+        KeyError
+            If a point-data key is missing or ``implementation`` does not name
+            a registered backend.
+        ImportError
+            If an explicitly requested backend is unavailable.
+        RuntimeError
+            If runtime validation or coefficient fitting fails, including for
+            a singular system or during CUDA Graph capture.
+
+        Notes
+        -----
+        The thin-plate-spline field has global support. Connectivity and
+        attached mesh and domain data are retained. Attached vector and tensor
+        fields are treated as Lagrangian data and are not pushed forward.
+        Geometry caches are invalidated and topology caches are retained on each
+        component. The operation does not detect inverted, degenerate, or
+        self-intersecting cells. Use each component mesh's
+        :meth:`Mesh.validate` method explicitly when required. Coefficient
+        fitting is not supported inside CUDA Graph capture because the
+        singular-system check requires host interaction.
+        """
+        if not isinstance(control_points, torch.Tensor):
+            raise TypeError(
+                "control_points must be a torch.Tensor, got "
+                f"{type(control_points).__name__}"
+            )
+        if not isinstance(control_displacements, torch.Tensor):
+            raise TypeError(
+                "control_displacements must be a torch.Tensor, got "
+                f"{type(control_displacements).__name__}"
+            )
+        if point_weights is not None and not isinstance(point_weights, (str, tuple)):
+            raise TypeError(
+                "DomainMesh.radial_basis_function_deform point_weights must be "
+                "a common point_data key/path, not a raw tensor"
+            )
+
+        from physicsnemo.mesh.transformations.deform._utils import (
+            _resolve_domain_point_weights,
+        )
+        from physicsnemo.nn.functional.geometry.deform import (
+            radial_basis_function_deform_points,
+        )
+
+        components: list[tuple[str, Mesh]] = [("interior", self.interior)]
+        components.extend(
+            (f"boundaries[{name!r}]", self.boundaries[name])
+            for name in self.boundaries.keys()
+        )
+        resolved_point_weights = _resolve_domain_point_weights(
+            components, point_weights, control_points, "control_points"
+        )
+
+        def apply_field(
+            combined_points: Float[torch.Tensor, "n_points n_spatial_dims"],
+            combined_point_weights: Bool[torch.Tensor, " n_points"]
+            | Float[torch.Tensor, " n_points"]
+            | None,
+        ) -> Float[torch.Tensor, "n_points n_spatial_dims"]:
+            return radial_basis_function_deform_points(
+                combined_points,
+                control_points,
+                control_displacements,
+                kernel=kernel,
+                polynomial=polynomial,
+                smoothing=smoothing,
+                point_weights=combined_point_weights,
+                implementation=implementation,
+            )
+
+        return self._deform_components(components, resolved_point_weights, apply_field)
+
+    def free_form_deform(
+        self,
+        control_displacements: Float[
+            torch.Tensor, "*lattice_resolution n_spatial_dims"
+        ],
+        *,
+        origin: Float[torch.Tensor, " n_spatial_dims"] | Sequence[float] | None = None,
+        extent: Float[torch.Tensor, " n_spatial_dims"] | Sequence[float] | None = None,
+        basis: _FFDBasis = "bernstein",
+        point_weights: str | tuple[str, ...] | None = None,
+        implementation: Literal["torch", "warp"] | None = None,
+    ) -> "DomainMesh":
+        """Deform the interior and all boundaries with one lattice field.
+
+        Every component uses the same control lattice, box, basis, and backend.
+        With ``point_weights=None``, coincident interior and boundary points
+        receive the same motion. When supplied, ``point_weights`` is a common
+        :attr:`Mesh.point_data` key (or nested tuple key) resolved independently
+        on each component. Raw point-weight tensors are rejected because
+        component point counts differ.
+
+        Parameters
+        ----------
+        control_displacements : torch.Tensor
+            Displacement vectors, not destination coordinates, for every
+            lattice node, with shape ``(n_1, ..., n_D, n_spatial_dims)`` and
+            the same float32 or float64 dtype and device as every component's
+            points. Each axis needs at least two nodes for ``"bernstein"`` and
+            the node-interpolating bases, and four for ``"bspline"``.
+        origin : torch.Tensor, sequence of float, or None, optional
+            Minimum corner of the lattice box with shape
+            ``(n_spatial_dims,)``. ``None`` uses the minimum corner of the
+            combined component bounds. For repeated GPU calls with an explicit
+            box, create ``origin`` and ``extent`` once as device tensors. Reuse
+            them to avoid recreating and transferring sequence values.
+        extent : torch.Tensor, sequence of float, or None, optional
+            Edge lengths of the lattice box. Every value must be finite and
+            strictly positive. The operation does not validate tensor values at
+            runtime. ``None`` sizes the box from ``origin`` to the maximum
+            corner of the combined component bounds. Validating a derived
+            extent synchronizes with the device and is not CUDA Graph
+            capture-safe. For capture, pass both ``origin`` and ``extent`` as
+            device tensors. Every coordinate axis must have positive range
+            when the extent is derived. Otherwise, supply an explicit extent.
+        basis : {"bernstein", "bspline", "linear", "cubic_hermite", "quintic_hermite"}, optional
+            Per-axis basis family. ``"bernstein"`` provides global support.
+            ``"bspline"`` uses local four-node-per-axis support. B-spline
+            coefficient index ``i`` corresponds to local coordinate
+            ``(i - 1) / (n - 3)``. The first and last coefficient planes lie
+            outside the evaluation box. ``"linear"``, ``"cubic_hermite"``, and
+            ``"quintic_hermite"`` use two neighboring nodes per axis. The
+            resulting fields are C0, C1, and C2 across cell boundaries,
+            respectively. See
+            :func:`~physicsnemo.mesh.transformations.deform.free_form_deform`
+            for their polynomial weights and literature reference. Default is
+            ``"bernstein"``.
+        point_weights : str, tuple[str, ...], or None
+            Optional point-data key present in every component and resolved
+            independently on each component. Each resolved tensor must have
+            shape ``(component.n_points,)`` and match the component point
+            device. All components must use one common bool or floating dtype.
+            Floating weights must also match the point dtype. Raw tensors are
+            not accepted.
+        implementation : {"torch", "warp"} or None
+            Backend override. Automatic dispatch uses Torch on CPU. On CUDA, it
+            uses Warp when available and otherwise Torch.
+
+        Returns
+        -------
+        DomainMesh
+            New domain with deformed component meshes and unchanged domain
+            data.
+
+        Raises
+        ------
+        TypeError
+            If tensors, lattice values, or point weights have unsupported
+            types or dtypes.
+        ValueError
+            If component layouts, lattice parameters, point weights, or
+            ``basis`` are invalid.
+        KeyError
+            If a point-data key or ``implementation`` name is not found.
+        ImportError
+            If an explicitly requested backend is unavailable.
+
+        Notes
+        -----
+        The operation retains connectivity and attached mesh and domain data.
+        It treats attached vector and tensor fields as Lagrangian data and does
+        not push them forward. It invalidates geometry caches and retains
+        topology caches on each component. Points outside the lattice box are
+        unchanged. To keep the exterior fixed, zero the outermost coefficient
+        plane on every Bernstein or node-interpolating face. For cubic
+        B-splines, zero the first and last three coefficient planes on every
+        axis. ``origin`` and ``extent`` are non-differentiable lattice
+        parameters. The operation does not automatically detect inverted,
+        degenerate, or self-intersecting cells. Validate each component mesh
+        explicitly with :meth:`Mesh.validate` when required.
+        """
+        if not isinstance(control_displacements, torch.Tensor):
+            raise TypeError(
+                "control_displacements must be a torch.Tensor, got "
+                f"{type(control_displacements).__name__}"
+            )
+        if point_weights is not None and not isinstance(point_weights, (str, tuple)):
+            raise TypeError(
+                "DomainMesh.free_form_deform point_weights must be a common "
+                "point_data key/path, not a raw tensor"
+            )
+
+        from physicsnemo.mesh.transformations.deform._utils import (
+            _resolve_domain_point_weights,
+        )
+        from physicsnemo.mesh.transformations.deform.ffd import _default_lattice_box
+        from physicsnemo.nn.functional.geometry.deform import free_form_deform_points
+
+        components: list[tuple[str, Mesh]] = [("interior", self.interior)]
+        components.extend(
+            (f"boundaries[{name!r}]", self.boundaries[name])
+            for name in self.boundaries.keys()
+        )
+        resolved_point_weights = _resolve_domain_point_weights(
+            components, point_weights, control_displacements, "control_displacements"
+        )
+
+        def apply_field(
+            combined_points: Float[torch.Tensor, "n_points n_spatial_dims"],
+            combined_point_weights: Bool[torch.Tensor, " n_points"]
+            | Float[torch.Tensor, " n_points"]
+            | None,
+        ) -> Float[torch.Tensor, "n_points n_spatial_dims"]:
+            box_origin, box_extent = _default_lattice_box(
+                combined_points, origin, extent
+            )
+            return free_form_deform_points(
+                combined_points,
+                control_displacements,
+                origin=box_origin,
+                extent=box_extent,
+                basis=basis,
+                point_weights=combined_point_weights,
+                implementation=implementation,
+            )
+
+        return self._deform_components(components, resolved_point_weights, apply_field)
+
+    def _deform_components(
+        self,
+        components: list[tuple[str, Mesh]],
+        resolved_point_weights: list[
+            Bool[torch.Tensor, " n_component_points"]
+            | Float[torch.Tensor, " n_component_points"]
+        ],
+        apply_field: Callable[
+            [
+                Float[torch.Tensor, "n_points n_spatial_dims"],
+                Bool[torch.Tensor, " n_points"]
+                | Float[torch.Tensor, " n_points"]
+                | None,
+            ],
+            Float[torch.Tensor, "n_points n_spatial_dims"],
+        ],
+    ) -> "DomainMesh":
+        """Deform every component with one combined world-space evaluation.
+
+        Evaluating the common field once avoids repeated dispatch and field
+        setup across boundaries. Splitting the result retains autograd links to
+        every component's original points and optional point weights.
+        """
+        component_meshes = [component for _, component in components]
+        point_counts = [component.n_points for component in component_meshes]
+        has_point_weights = bool(resolved_point_weights)
+        if len(component_meshes) == 1:
+            combined_points = component_meshes[0].points
+            combined_point_weights = (
+                resolved_point_weights[0] if has_point_weights else None
+            )
+        else:
+            combined_points = torch.cat(
+                [component.points for component in component_meshes], dim=0
+            )
+            combined_point_weights = (
+                torch.cat(resolved_point_weights, dim=0) if has_point_weights else None
+            )
+
+        combined_output = apply_field(combined_points, combined_point_weights)
+        output_points = (
+            (combined_output,)
+            if len(component_meshes) == 1
+            else combined_output.split(point_counts, dim=0)
+        )
+        output_meshes = [
+            component.with_points(points)
+            for component, points in zip(component_meshes, output_points)
+        ]
+
+        interior = output_meshes[0]
+        boundaries = {
+            name: output_meshes[index]
+            for index, name in enumerate(self.boundaries.keys(), start=1)
+        }
+        return replace(
+            self,
+            interior=interior,
+            boundaries=boundaries,
+            global_data=self.global_data.clone(),
+        )
 
     ### Cleanup / Refinement
 
@@ -635,17 +1216,26 @@ class DomainMesh:
             )
         )
 
-    def strip_caches(self) -> "DomainMesh":
+    def strip_caches(
+        self,
+        keep: str | tuple[str, ...] | Sequence[str | tuple[str, ...]] = (),
+    ) -> "DomainMesh":
         r"""Remove cached geometry from all meshes in the domain.
 
         Delegates to :meth:`Mesh.strip_caches` for each mesh.
 
+        Parameters
+        ----------
+        keep : str, tuple[str, ...], or sequence of either, optional
+            Cache keys to retain on every component mesh. See
+            :meth:`Mesh.strip_caches` for key semantics.
+
         Returns
         -------
         DomainMesh
-            New domain with all cached values cleared.
+            New domain retaining only the requested cached values on each mesh.
         """
-        return self.apply_to_meshes(lambda m: m.strip_caches())
+        return self.apply_to_meshes(lambda m: m.strip_caches(keep=keep))
 
     def subdivide(
         self,
@@ -779,8 +1369,10 @@ class DomainMesh:
         check_inverted_cells: bool = False,
         check_out_of_bounds: bool = True,
         check_manifoldness: bool = False,
-        tolerance: float = 1e-10,
+        tolerance: float | None = None,
         raise_on_error: bool = False,
+        *,
+        check_self_intersection: bool = False,
     ) -> dict[str, Any]:
         r"""Validate all meshes in the domain and aggregate results.
 
@@ -799,10 +1391,15 @@ class DomainMesh:
             Check cell indices are valid.
         check_manifoldness : bool, optional
             Check manifold topology.
-        tolerance : float, optional
-            Tolerance for geometric checks.
+        tolerance : float | None, optional
+            Tolerance for geometric checks. If ``None`` (default), each mesh
+            uses a dtype-aware epsilon.
         raise_on_error : bool, optional
             Raise ``ValueError`` on first error vs return report.
+        check_self_intersection : bool, optional
+            Request self-intersection checks for every component. This option
+            is keyword-only and not yet implemented; passing ``True`` raises
+            ``NotImplementedError``.
 
         Returns
         -------
@@ -815,6 +1412,12 @@ class DomainMesh:
             - ``"boundaries"``: ``dict[str, Mapping[str, ...]]`` of per-boundary
               reports.
             - ``"valid"``: ``bool``, ``True`` only if all meshes pass validation.
+
+        Raises
+        ------
+        NotImplementedError
+            If ``check_self_intersection=True`` because component-level
+            self-intersection checking is not yet implemented.
         """
         kwargs: dict[str, Any] = dict(
             check_degenerate_cells=check_degenerate_cells,
@@ -822,6 +1425,7 @@ class DomainMesh:
             check_inverted_cells=check_inverted_cells,
             check_out_of_bounds=check_out_of_bounds,
             check_manifoldness=check_manifoldness,
+            check_self_intersection=check_self_intersection,
             tolerance=tolerance,
             raise_on_error=raise_on_error,
         )
@@ -1118,46 +1722,3 @@ class DomainMesh:
                 **boundary_defaults,
             )
         return canvas
-
-    ### Repr is defined after the class body (see below) because
-    ### @tensorclass overwrites __repr__ even when defined inline.
-
-
-### Override the tensorclass __repr__ with custom formatting.
-# Must be done after class definition because @tensorclass overrides __repr__
-# even when defined inside the class body (same pattern as Mesh).
-def _domain_mesh_repr(self: DomainMesh) -> str:
-    """Format a readable summary of the domain mesh."""
-    lines = ["DomainMesh("]
-
-    ### Interior - indent data fields one level under "interior:"
-    interior_repr = format_mesh_repr(self.interior)
-    first, *rest = interior_repr.split("\n")
-    lines.append(f"    interior: {first}")
-    lines.extend(f"    {line}" for line in rest)
-
-    ### Boundaries - indent data fields one level under each boundary key
-    bc_names = self.boundary_names
-    if not bc_names:
-        lines.append("    boundaries: {}")
-    else:
-        lines.append("    boundaries:")
-        max_bc_len = max(len(n) for n in bc_names)
-        for name in bc_names:
-            bc_mesh = self.boundaries[name]
-            bc_repr = format_mesh_repr(bc_mesh)
-            first, *rest = bc_repr.split("\n")
-            lines.append(f"        {name.ljust(max_bc_len)}: {first}")
-            lines.extend(f"        {line}" for line in rest)
-
-    ### Global data (only if non-empty)
-    gd_keys = sorted(self.global_data.keys())
-    if gd_keys:
-        items = ", ".join(f"{k}: {tuple(self.global_data[k].shape)}" for k in gd_keys)
-        lines.append(f"    global_data: {{{items}}}")
-
-    lines.append(")")
-    return "\n".join(lines)
-
-
-DomainMesh.__repr__ = _domain_mesh_repr  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]

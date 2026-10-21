@@ -26,73 +26,9 @@ import torch
 from physicsnemo.mesh.mesh import Mesh
 
 ### Helper Functions ###
-
-
-def create_simple_mesh(
-    n_spatial_dims: int, n_manifold_dims: int, device: torch.device | str = "cpu"
-):
-    """Create a simple mesh for testing."""
-    if n_manifold_dims > n_spatial_dims:
-        raise ValueError(
-            f"Manifold dimension {n_manifold_dims} cannot exceed spatial dimension {n_spatial_dims}"
-        )
-
-    if n_manifold_dims == 1:
-        if n_spatial_dims == 2:
-            points = torch.tensor(
-                [[0.0, 0.0], [1.0, 0.0], [1.5, 1.0], [0.5, 1.5]], device=device
-            )
-        elif n_spatial_dims == 3:
-            points = torch.tensor(
-                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 1.0]],
-                device=device,
-            )
-        else:
-            raise ValueError(f"Unsupported {n_spatial_dims=}")
-        cells = torch.tensor([[0, 1], [1, 2], [2, 3]], device=device, dtype=torch.int64)
-    elif n_manifold_dims == 2:
-        if n_spatial_dims == 2:
-            points = torch.tensor(
-                [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [1.5, 0.5]], device=device
-            )
-        elif n_spatial_dims == 3:
-            points = torch.tensor(
-                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0], [1.5, 0.5, 0.5]],
-                device=device,
-            )
-        else:
-            raise ValueError(f"Unsupported {n_spatial_dims=}")
-        cells = torch.tensor([[0, 1, 2], [1, 3, 2]], device=device, dtype=torch.int64)
-    elif n_manifold_dims == 3:
-        if n_spatial_dims == 3:
-            points = torch.tensor(
-                [
-                    [0.0, 0.0, 0.0],
-                    [1.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0],
-                    [0.0, 0.0, 1.0],
-                    [1.0, 1.0, 1.0],
-                ],
-                device=device,
-            )
-            cells = torch.tensor(
-                [[0, 1, 2, 3], [1, 2, 3, 4]], device=device, dtype=torch.int64
-            )
-        else:
-            raise ValueError("3-simplices require 3D embedding space")
-    else:
-        raise ValueError(f"Unsupported {n_manifold_dims=}")
-
-    return Mesh(points=points, cells=cells)
-
-
-def assert_on_device(tensor: torch.Tensor, expected_device: str) -> None:
-    """Assert tensor is on expected device."""
-    actual_device = tensor.device.type
-    assert actual_device == expected_device, (
-        f"Device mismatch: tensor is on {actual_device!r}, expected {expected_device!r}"
-    )
-
+# The point/cell literals previously duplicated here are the shared
+# conftest factory's canonical meshes.
+from test.mesh.conftest import assert_on_device, create_simple_mesh  # noqa: E402
 
 ### Test Fixtures ###
 
@@ -193,6 +129,50 @@ class TestCellDataToPointData:
         with pytest.raises(ValueError):
             mesh.cell_data_to_point_data()
 
+    def test_key_conflict_between_field_and_group_raises_error(self):
+        """A cell field named like a point data group conflicts with it."""
+        points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        cells = torch.tensor([[0, 1, 2]])
+        mesh = Mesh(
+            points=points,
+            cells=cells,
+            point_data={"p": {"ref": torch.tensor([1.0, 2.0, 3.0])}},
+            cell_data={"p": torch.tensor([7.0])},
+        )
+
+        with pytest.raises(ValueError):
+            mesh.cell_data_to_point_data()
+
+    def test_key_conflict_between_empty_group_and_field_raises_error(self):
+        """An empty cell data group named like a nested point field conflicts."""
+        points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        cells = torch.tensor([[0, 1, 2]])
+        mesh = Mesh(
+            points=points,
+            cells=cells,
+            point_data={"g": {"p": torch.tensor([1.0, 2.0, 3.0])}},
+            cell_data={"g": {"p": {}}},
+        )
+
+        with pytest.raises(ValueError):
+            mesh.cell_data_to_point_data()
+
+    def test_groups_with_disjoint_fields_merge(self):
+        """Groups of the same name merge when their fields differ."""
+        points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        cells = torch.tensor([[0, 1, 2]])
+        mesh = Mesh(
+            points=points,
+            cells=cells,
+            point_data={"g": {"a": torch.tensor([1.0, 2.0, 3.0])}},
+            cell_data={"g": {"b": torch.tensor([7.0])}},
+        )
+
+        result = mesh.cell_data_to_point_data()
+
+        assert torch.equal(result.point_data["g", "a"], torch.tensor([1.0, 2.0, 3.0]))
+        assert torch.equal(result.point_data["g", "b"], torch.tensor([7.0, 7.0, 7.0]))
+
     def test_overwrite_keys(self):
         """Test that overwrite_keys=True allows overwriting."""
         points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
@@ -226,6 +206,53 @@ class TestCellDataToPointData:
 
         ### Cached property should not be in point_data (should not leak from cell_data)
         assert result._cache.get(("point", "centroids"), None) is None
+
+    def test_integer_cell_field_promoted_to_float(self):
+        """Regression: integer cell fields are averaged in float, not truncated.
+
+        Averaging a per-cell integer field (e.g. a material/region ID) onto
+        points yields a generally non-integral mean, so the resulting point
+        field is promoted to floating point rather than int-truncated.
+        """
+        points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        cells = torch.tensor([[0, 1, 2], [1, 3, 2]])
+        mesh = Mesh(
+            points=points,
+            cells=cells,
+            cell_data={"material_id": torch.tensor([1, 2], dtype=torch.int64)},
+        )
+
+        result = mesh.cell_data_to_point_data()
+
+        material = result.point_data["material_id"]
+        assert torch.is_floating_point(material)
+        # Point 1 is shared by both cells: mean(1, 2) = 1.5 (not truncated to 1).
+        assert torch.allclose(material[1], torch.tensor(1.5, dtype=material.dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    def test_complex_cell_field_preserves_imaginary_part(self, dtype):
+        """Regression: complex cell fields keep their dtype and imaginary part.
+
+        Complex tensors are not "floating point" by ``torch``'s definition, so
+        a complex field was previously promoted to float64 like an integer
+        field, silently discarding the imaginary part.
+        """
+        points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        cells = torch.tensor([[0, 1, 2], [1, 3, 2]])
+        mesh = Mesh(
+            points=points,
+            cells=cells,
+            cell_data={"impedance": torch.tensor([1 + 2j, 3 + 6j], dtype=dtype)},
+        )
+
+        result = mesh.cell_data_to_point_data()
+
+        impedance = result.point_data["impedance"]
+        assert impedance.dtype == dtype
+        # Points 0 and 3 belong to one cell each; points 1 and 2 are shared, so
+        # they average to (1+2j + 3+6j) / 2 = 2+4j.
+        expected = torch.tensor([1 + 2j, 2 + 4j, 2 + 4j, 3 + 6j], dtype=dtype)
+        torch.testing.assert_close(impedance, expected)
 
 
 class TestPointDataToCellData:
@@ -285,6 +312,74 @@ class TestPointDataToCellData:
         expected = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).mean(dim=0)
         assert torch.allclose(result.cell_data["velocity"][0], expected)
 
+    @pytest.mark.parametrize(
+        ("values", "expected"),
+        [
+            (torch.tensor([1, 2, 4], dtype=torch.int64), 7.0 / 3.0),
+            (torch.tensor([1, 2, 4], dtype=torch.int32), 7.0 / 3.0),
+            (torch.tensor([True, False, True]), 2.0 / 3.0),
+        ],
+        ids=["int64", "int32", "bool"],
+    )
+    def test_discrete_point_field_promoted_to_float(self, values, expected):
+        """Integer and boolean means are computed without dtype errors or truncation."""
+        mesh = Mesh(
+            points=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+            cells=torch.tensor([[0, 1, 2]]),
+            point_data={"label": values},
+        )
+
+        result = mesh.point_data_to_cell_data().cell_data["label"]
+
+        assert result.dtype == torch.float64
+        torch.testing.assert_close(
+            result, torch.tensor([expected], dtype=torch.float64)
+        )
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float32, torch.float64, torch.float16, torch.bfloat16, torch.complex64],
+        ids=str,
+    )
+    def test_continuous_point_field_dtype_unchanged(self, dtype):
+        """Floating and complex point fields pass through the promotion untouched.
+
+        The promotion only fires for the dtypes that ``torch.mean`` rejects
+        outright, so it cannot change the result of any conversion that already
+        worked.
+        """
+        mesh = Mesh(
+            points=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+            cells=torch.tensor([[0, 1, 2]]),
+            point_data={"field": torch.tensor([1, 2, 4]).to(dtype)},
+        )
+
+        result = mesh.point_data_to_cell_data().cell_data["field"]
+
+        assert result.dtype == dtype
+        torch.testing.assert_close(result, torch.tensor([7.0 / 3.0]).to(dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=str)
+    @pytest.mark.parametrize("n_vertices_per_cell", [2, 3, 4])
+    def test_reduced_precision_field_matches_mean(self, dtype, n_vertices_per_cell):
+        """Half-precision fields round once, exactly as ``mean(dim=1)`` does."""
+        generator = torch.Generator().manual_seed(0)
+        n_points = 50
+        point_values = (torch.randn(n_points, 3, generator=generator) * 20).to(dtype)
+        cells = torch.randint(
+            0, n_points, (200, n_vertices_per_cell), generator=generator
+        )
+        mesh = Mesh(
+            points=torch.randn(n_points, 3, generator=generator),
+            cells=cells,
+            point_data={"field": point_values},
+        )
+
+        result = mesh.point_data_to_cell_data().cell_data["field"]
+
+        assert result.dtype == dtype
+        assert torch.equal(result, point_values[cells].mean(dim=1))
+
     def test_preserves_original_data(self):
         """Test that original point data is preserved."""
         points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
@@ -313,6 +408,34 @@ class TestPointDataToCellData:
         )
 
         ### Should raise error
+        with pytest.raises(ValueError):
+            mesh.point_data_to_cell_data()
+
+    def test_key_conflict_between_group_and_field_raises_error(self):
+        """A point data group named like a cell field conflicts with it."""
+        points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        cells = torch.tensor([[0, 1, 2]])
+        mesh = Mesh(
+            points=points,
+            cells=cells,
+            point_data={"q": {"x": torch.tensor([1.0, 2.0, 3.0])}},
+            cell_data={"q": torch.tensor([42.0])},
+        )
+
+        with pytest.raises(ValueError):
+            mesh.point_data_to_cell_data()
+
+    def test_key_conflict_between_empty_group_and_field_raises_error(self):
+        """An empty point data group named like a cell field conflicts with it."""
+        points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        cells = torch.tensor([[0, 1, 2]])
+        mesh = Mesh(
+            points=points,
+            cells=cells,
+            point_data={"p": {}},
+            cell_data={"p": torch.tensor([42.0])},
+        )
+
         with pytest.raises(ValueError):
             mesh.point_data_to_cell_data()
 
@@ -634,3 +757,19 @@ class TestDataConversionParametrized:
         # Devices should be preserved
         assert_on_device(result1.points, device)
         assert_on_device(result2.points, device)
+
+
+def test_cell_data_to_point_data_does_not_alias_source_cache():
+    """Regression: a derived mesh must own its cache container, so caching a new
+    property on it does not leak back into the source mesh's cache (the methods
+    previously passed ``_cache=self._cache`` by reference).
+    """
+    points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    cells = torch.tensor([[0, 1, 2]])
+    mesh = Mesh(points=points, cells=cells, cell_data={"x": torch.tensor([1.0])})
+
+    derived = mesh.cell_data_to_point_data()
+    assert mesh._cache.get(("cell", "centroids"), None) is None
+    _ = derived.cell_centroids  # populate a NEW cache entry on the derived mesh
+    # The source mesh's cache must remain untouched (independent container).
+    assert mesh._cache.get(("cell", "centroids"), None) is None

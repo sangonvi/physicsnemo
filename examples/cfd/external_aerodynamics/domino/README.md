@@ -85,13 +85,27 @@ Please refer to
 with `PhysicsNeMo-Curator`.
 
 Download the DrivAer ML dataset using the
-[provided instructions in PhysicsNeMo-Curator](https://github.com/NVIDIA/physicsnemo-curator/blob/main/examples/external_aerodynamics/README.md#download-drivaerml-dataset).
+[provided instructions in PhysicsNeMo-Curator](https://github.com/NVIDIA/physicsnemo-curator/blob/main/examples/cae/drivaerml/README.md#download-the-dataset).
+Before preprocessing, verify downloaded files against the SHA-256 object IDs in
+an immutable dataset revision. For example, the versioned
+[DrivAerML `run_1` files](https://huggingface.co/datasets/neashton/drivaerml/tree/f26d75e0d3dee10ba0e42829bafd0e0d95ca5acc/run_1)
+give these checksums:
+
+```console
+$ sha256sum run_1/boundary_1.vtp run_1/drivaer_1.stl
+01d388402dad7a783db9c666ddb18e6db745aac16a3193c275e0726dd108bb40  run_1/boundary_1.vtp
+411e6651284a26fc94924106b833fd79febc6deba63922c929dd8acfc99720d2  run_1/drivaer_1.stl
+```
+
+Use the same versioned file listing to verify every run selected for
+preprocessing.
+
 The first step for running the DoMINO pipeline requires processing the raw data
 (vtp, vtu and stl) into either Zarr or NumPy format for training.
 Each of the raw simulations files are downloaded in `vtp`, `vtu` and `stl` formats.
 For instructions on running data processing to produce a DoMINO training ready dataset,
 please refer to
-[How-to Curate data for DoMINO Model](https://github.com/NVIDIA/physicsnemo-curator/blob/main/examples/external_aerodynamics/README.md).
+[How-to Curate data for DoMINO Model](https://github.com/NVIDIA/physicsnemo-curator/blob/main/examples/cae/drivaerml/README.md).
 
 Caching is implemented in
 [`CachedDoMINODataset`](https://github.com/NVIDIA/physicsnemo/blob/main/physicsnemo/datapipes/cae/domino_datapipe.py#L1056).
@@ -182,11 +196,12 @@ To train and test the DoMINO model on AWS dataset, follow these steps:
 ### Training with Domain Parallelism
 
 DoMINO has support for training and inference using domain parallelism in PhysicsNeMo,
-via the `ShardTensor` mechanisms and pytorch's FSDP tools.  `ShardTensor`, built on
-PyTorch's `DTensor` object, is a domain-parallel-aware tensor that can live on multiple
-GPUs and perform operations in a numerically consistent way.  For more information
-about the techniques of domain parallelism and `ShardTensor`, refer to PhysicsNeMo
-tutorials such as [`ShardTensor`](https://docs.nvidia.com/deeplearning/physicsnemo/physicsnemo-core/api/physicsnemo.distributed.shardtensor.html).
+using the `ShardTensor` mechanisms and PyTorch's FSDP2 (`fully_shard`) tools.
+`ShardTensor` is a `torch.Tensor` subclass that is domain-parallel aware. It can live
+on multiple GPUs and perform operations in a numerically consistent way, and plain
+`nn.Module`s work on it unmodified.  For more information about the techniques of
+domain parallelism and `ShardTensor`, refer to PhysicsNeMo tutorials such as
+[`ShardTensor`](https://docs.nvidia.com/deeplearning/physicsnemo/physicsnemo-core/api/physicsnemo.domain_parallel.html).
 
 In DoMINO specifically, domain parallelism has been enabled in two ways, which
 can be used concurrently or separately.  First, the input sampled volumetric
@@ -215,6 +230,10 @@ parallelism over the latent space and input/output points, respectively.
 Setting domain_size > 1 without specifying `shard_points=True` or `shard_grid=True`
 will result in a runtime error during configuration - if you do not want to use
 domain_parallelism, leave `domain_size=1`.
+
+At model startup, the training script synchronizes the plain model parameters and
+buffers across each domain-parallel group. It then applies FSDP2 over the
+data-parallel mesh.
 
 ### Performance Optimizations
 
@@ -472,8 +491,8 @@ predictions' ability to respect the governing laws better.
 </table>
 <!-- markdownlint-enable -->
 
-*Addition of physics constraints to the DoMINO training is under active
-development and might introduce breaking changes in the future*
+_Addition of physics constraints to the DoMINO training is under active
+development and might introduce breaking changes in the future_
 
 ### Retraining recipe for DoMINO model
 
@@ -643,8 +662,8 @@ The steps below outline the process.
   Please modify these formulations if your variables are in a different order
   or don't require these losses.
 5. Run `test.py` to validate the trained model.
-6. Use `inference_on_stl.py` script to deploy the model in applications where inference is
-   needed only from STL inputs and the volume mesh is not calculated.
+6. Use `inference_on_stl.py` script to deploy the model in applications where inference
+   is needed only from STL inputs and the volume mesh is not calculated.
 
 The DoMINO model architecture is used to support the
 [Real Time Digital Twin Blueprint](https://github.com/NVIDIA-Omniverse-blueprints/digital-twins-for-fluid-simulation)

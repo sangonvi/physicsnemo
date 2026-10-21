@@ -59,9 +59,12 @@ Reproducibility flows from the `DataLoader`.  The loader seeds a
 master `torch.Generator` and passes it to
 `MeshDataset.set_generator(parent_gen)`, which forks the parent
 into independent children — one for the reader and one per
-transform.  `MeshDataset.set_epoch(epoch)` reseeds every child
-with `initial_seed() + epoch` so each epoch is different but
-deterministic.  Deterministic transforms silently ignore both calls.
+transform.  `MeshDataset.set_epoch(epoch)` reseeds every stochastic
+transform from its captured base seed via `derive_seed(base_seed,
+epoch)` so each epoch is different but deterministic — and because the
+seed depends only on `(base_seed, epoch)`, resuming at epoch *N*
+reproduces the same stream as a continuous run.  Deterministic
+transforms silently ignore both calls.
 
 For standalone usage outside a `DataLoader`, call `set_generator`
 on the transform directly:
@@ -113,7 +116,7 @@ aug.set_generator(torch.Generator().manual_seed(42))
 aug = RandomTranslateMesh(
     distribution=D.Uniform(
         torch.tensor([-0.1, -0.2, -0.3]),
-        torch.tensor([ 0.1,  0.2,  0.3]),
+        torch.tensor([0.1, 0.2, 0.3]),
     ),
 )
 
@@ -175,15 +178,25 @@ syntax:
     scale: 0.1
 ```
 
-For per-axis batched distributions in YAML, pass list parameters:
+For per-axis batched distributions in YAML, build each parameter with
+`torch.tensor`.  Hydra passes a YAML list as an OmegaConf
+`ListConfig`, which `torch.distributions` rejects:
 
 ```yaml
 - _target_: ${dp:RandomTranslateMesh}
   distribution:
     _target_: torch.distributions.Uniform
-    low: [-0.1, -0.2, -0.3]
-    high: [0.1, 0.2, 0.3]
+    low:
+      _target_: torch.tensor
+      data: [-0.1, -0.2, -0.3]
+    high:
+      _target_: torch.tensor
+      data: [0.1, 0.2, 0.3]
 ```
+
+To pin an axis at a constant, give it a zero-width range
+(`low == high`) and pass `validate_args: false`, since `Uniform`
+otherwise requires `low < high`.
 
 ## Supported Distributions
 

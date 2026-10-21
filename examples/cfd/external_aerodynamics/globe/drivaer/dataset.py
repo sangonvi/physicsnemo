@@ -36,6 +36,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 from physicsnemo.experimental.utils import CachedPreprocessingDataset
 from physicsnemo.mesh import Mesh
+from physicsnemo.mesh.calculus.measure import (
+    cell_measures,
+    scale_measures,
+    set_cell_measures,
+)
 from physicsnemo.mesh.io import from_pyvista
 from physicsnemo.mesh.primitives.planar import structured_grid
 from physicsnemo.mesh.projections import embed
@@ -107,7 +112,7 @@ def create_domain_boundaries(
             target_n_spatial_dims=3,
         ).translate([0.0, 0.0, ground_z])
         # Flip cell winding so normals point upward (+z, into the fluid domain)
-        return Mesh(points=mesh.points, cells=mesh.cells[:, [0, 2, 1]])
+        return mesh.with_cells(mesh.cells[:, [0, 2, 1]])
 
     return {
         "slip_floor": _ground_patch(x_upstream, x_bl),
@@ -249,9 +254,9 @@ class DrivAerMLDataSet(CachedPreprocessingDataset):
           areas that approximate the surface Voronoi diagram of the subsampled
           centroids, at the cost of an O(N) nearest-neighbour pass over the
           full mesh each time a sample is loaded.
-        * **Uniform** (``voronoi=False``): rescales all subsampled cell areas
-          by a single global factor so that total area is conserved.  Much
-          faster, but every subsampled cell gets the same scale factor
+        * **Uniform** (``voronoi=False``): rescales the retained effective
+          measures so that their total matches the full surface.
+          Much faster, but every subsampled cell gets the same factor
           regardless of local density.
 
         Args:
@@ -266,7 +271,8 @@ class DrivAerMLDataSet(CachedPreprocessingDataset):
                 uniform area rescaling (faster, but less accurate).
 
         Returns:
-            Mesh with ``n_cells`` cells and corrected area cache.
+            Mesh with ``n_cells`` cells and a corrected integration measure
+            (uniform: reweighted measures; Voronoi: cluster measures and normals).
         """
         if n_cells <= 0:
             raise ValueError(f"{n_cells=!r} must be positive.")
@@ -278,18 +284,22 @@ class DrivAerMLDataSet(CachedPreprocessingDataset):
         )
 
         if geometry_only:
-            boundary = Mesh(points=boundary.points, cells=boundary.cells)
+            measures = cell_measures(boundary)
+            boundary = boundary.with_data(point_data={}, cell_data={}, global_data={})
+            set_cell_measures(boundary, measures)
 
         if voronoi:
+            ### Cluster measures are explicit represented areas; the geometric
+            ### cell-area cache continues to describe the retained triangles.
+            ### Cluster normals retain the established boundary-input convention.
             partition = partition_cells(mesh, seeds=boundary.cell_centroids)
-            boundary._cache["cell", "areas"] = partition.cluster_areas
+            set_cell_measures(boundary, partition.cluster_areas)
             boundary._cache["cell", "normals"] = partition.cluster_normals
         else:
-            total_area = mesh.cell_areas.sum()
-            raw_areas = boundary.cell_areas
-            boundary._cache["cell", "areas"] = raw_areas * (
-                total_area / raw_areas.sum()
-            )
+            ### Normalize the retained measures to preserve the full represented
+            ### area, including any earlier corrections (Hajek estimator).
+            total_area = cell_measures(mesh).sum()
+            scale_measures(boundary, total_area / cell_measures(boundary).sum())
 
         return boundary
 
@@ -482,12 +492,12 @@ class DrivAerMLDataSet(CachedPreprocessingDataset):
 
         ### Build the prediction Mesh (geometry + prediction targets)
         prediction_mesh = from_pyvista(pv_surface_pt)
-        prediction_mesh = Mesh(
-            points=prediction_mesh.points,
-            cells=prediction_mesh.cells,
+        prediction_mesh = prediction_mesh.with_data(
             point_data=prediction_mesh.point_data.select("C_p", "C_f").apply(
                 torch.Tensor.float
             ),
+            cell_data={},
+            global_data={},
         )
 
         ### Parse geometry reference CSV
@@ -601,7 +611,9 @@ def postprocess(
         ``point_data["error"]`` for the selected fields, and
         ``global_data["pred"]`` (integrated from predictions) /
         ``global_data["true"]`` (CSV ground truth) each containing
-        scalar force coefficient tensors (Cd, Cl, Cs).
+        scalar force coefficient tensors (Cd, Cl, Cs). The mesh keeps the
+        effective cell measures of ``sample.prediction_mesh``, including
+        subsampling corrections.
 
     Raises:
         ValueError: If pred_mesh and the sample surface mesh have
@@ -631,15 +643,15 @@ def postprocess(
     # pred_mesh is a point cloud (no cells), so we construct a surface
     # mesh with true_mesh's cell connectivity for integration.
     a_ref = float(sample.dimensional_constants["A_ref"])
-    pred_surface = Mesh(
-        points=true_mesh.points,
-        cells=true_mesh.cells,
+    measures = cell_measures(true_mesh)
+    pred_surface = true_mesh.with_data(
         point_data=pred_mesh.point_data,
+        cell_data={},
+        global_data={},
     )
+    set_cell_measures(pred_surface, measures)
 
-    return Mesh(
-        points=true_mesh.points,
-        cells=true_mesh.cells,
+    combined = true_mesh.with_data(
         point_data=TensorDict(
             {
                 "true": true_selected,
@@ -648,6 +660,7 @@ def postprocess(
             },
             batch_size=[true_mesh.n_points],
         ),
+        cell_data={},
         global_data=TensorDict(
             {
                 "pred": compute_surface_force_coefficients(
@@ -657,6 +670,9 @@ def postprocess(
             }
         ),
     )
+    ### Disk rendering sizes cells by represented area, not kept-triangle area.
+    set_cell_measures(combined, measures)
+    return combined
 
 
 def visualize_comparison(
@@ -727,7 +743,7 @@ def compute_surface_force_coefficients(
 
     Computes drag, lift, and side-force coefficients by area-weighted
     integration of pressure and skin-friction contributions over the car
-    body surface.
+    body surface, using effective cell measures to account for subsampling.
 
     The pressure force on the body is ``-C_p * n`` (outward normal convention)
     and the friction force is ``C_f`` (tangential).  Normal orientation is
@@ -744,7 +760,7 @@ def compute_surface_force_coefficients(
     Returns:
         TensorDict with scalar-tensor entries ``"Cd"``, ``"Cl"``, ``"Cs"``.
     """
-    areas = surface_mesh.cell_areas  # (n_cells,)
+    areas = cell_measures(surface_mesh)  # (n_cells,)
     raw_normals = surface_mesh.cell_normals  # (n_cells, 3)
 
     ### Orient normals outward using the divergence theorem

@@ -23,6 +23,21 @@ If you are considering collaborating with NVIDIA PhysicsNeMo team to enhance Phy
 fill this [proposal form](https://forms.gle/fYsbZEtgRWJUQ3oQ9) and
 we will get back to you.
 
+### External Issues and Pull Requests are Encouraged
+
+You are encouraged to open real issues regarding your usage of PhysicsNeMo,
+request features, discuss items with the maintainers, or other topics.
+You do not need to open a corresponding Pull Request to open an issue, though you
+are welcome to do so.  Please follow the issue templates as much as you can,
+within reason.
+
+Usage of automated bots to find and open issues
+(that is, those NOT encountered naturally in the course of development and usage),
+and submit corresponding Pull Requests,
+is discouraged strongly.  Issues or Pull Requests that the maintainers
+deem are submitted entirely by bots,
+without human review, will be closed without review.
+
 ## Contribute to PhysicsNeMo-Core
 
 ### Codebase Structure
@@ -318,3 +333,7 @@ The pipeline has following stages:
     Aim for more than 80% code coverage.
     To test coverage locally, run the `get_coverage.sh` script from the `test` folder and
     check the coverage of the module that you added/edited.
+    In CI, the overall coverage gate (`COVERAGE_FAIL_UNDER`) is enforced by the `Coverage`
+    job and currently requires 70%. Every PR also gets an informational, non-blocking
+    `Coverage %` check reporting the measured percentage, and uncovered lines are annotated
+    inline in the PR's Files view once the Codecov integration is enabled.

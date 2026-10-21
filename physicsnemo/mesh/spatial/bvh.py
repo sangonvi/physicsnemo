@@ -29,9 +29,10 @@ from typing import TYPE_CHECKING
 
 import torch
 from jaxtyping import Bool, Float, Int
-from tensordict import tensorclass
+from tensordict import TensorClass
 
 from physicsnemo.mesh.neighbors._adjacency import Adjacency, build_adjacency_from_pairs
+from physicsnemo.mesh.spatial._lbvh import build_lbvh_topology
 from physicsnemo.mesh.spatial._ragged import _ragged_arange
 
 if TYPE_CHECKING:
@@ -42,9 +43,32 @@ if TYPE_CHECKING:
 # Morton code computation
 # ---------------------------------------------------------------------------
 
+# Shift-and-mask steps that move bit b of a coordinate to bit b*D, for the bits
+# per dimension that _compute_morton_codes uses (D=2: 31 bits, D=3: 21 bits).
+# D=1 needs no spreading.
+_MORTON_SPREAD_STEPS: dict[int, tuple[tuple[int, int], ...]] = {
+    1: (),
+    2: (
+        (16, 0x0000_FFFF_0000_FFFF),
+        (8, 0x00FF_00FF_00FF_00FF),
+        (4, 0x0F0F_0F0F_0F0F_0F0F),
+        (2, 0x3333_3333_3333_3333),
+        (1, 0x5555_5555_5555_5555),
+    ),
+    3: (
+        (32, 0x001F_0000_0000_FFFF),
+        (16, 0x001F_0000_FF00_00FF),
+        (8, 0x100F_00F0_0F00_F00F),
+        (4, 0x10C3_0C30_C30C_30C3),
+        (2, 0x1249_2492_4924_9249),
+    ),
+}
+
 
 def _compute_morton_codes(
     centroids: Float[torch.Tensor, "n_centroids n_spatial_dims"],
+    *,
+    isotropic: bool = False,
 ) -> Int[torch.Tensor, " n_centroids"]:
     """Compute morton codes (Z-order curve) for a set of points.
 
@@ -58,6 +82,11 @@ def _compute_morton_codes(
     ----------
     centroids : torch.Tensor
         Point coordinates, shape ``(N, D)``, any float dtype.
+    isotropic : bool, optional, default=False
+        If ``True``, every axis is quantized with the same scale (the largest
+        extent), so the Morton grid's cells are cubes. If ``False``, each axis
+        is stretched to the full grid independently, so the cells inherit the
+        aspect ratio of the bounding box.
 
     Returns
     -------
@@ -78,29 +107,49 @@ def _compute_morton_codes(
 
     N, D = centroids.shape
     device = centroids.device
+    if D == 0:
+        raise ValueError("centroids must contain at least one spatial dimension")
+    if N == 0:
+        return torch.empty(0, dtype=torch.int64, device=device)
 
-    ### Bits per dimension: 63 // D keeps total code <= 63 bits (non-negative int64)
-    n_bits = 63 // D
+    ### Bits per dimension: keep the total code within non-negative int64. For
+    ### D=1, a 63-bit grid maximum rounds to 2^63 in floating point before the
+    ### int64 conversion. Limit that case to 62 bits to avoid overflow.
+    n_bits = min(62, 63 // D)
     max_val = (1 << n_bits) - 1
 
-    ### Quantize centroids to integer grid [0, 2^n_bits - 1]
-    cmin = centroids.min(dim=0).values  # (D,)
-    cmax = centroids.max(dim=0).values  # (D,)
-    extent = (cmax - cmin).clamp(min=1e-30)  # avoid division by zero
-    coords = ((centroids - cmin) / extent * max_val).long().clamp(0, max_val)  # (N, D)
+    ### Quantize centroids to integer grid [0, 2^n_bits - 1]. Half-precision
+    ### dtypes cannot represent this grid's scale, so normalize in at least
+    ### float32 while retaining float64 input precision.
+    quantization_dtype = (
+        torch.float64 if centroids.dtype == torch.float64 else torch.float32
+    )
+    quantization_points = centroids.to(quantization_dtype)
+    cmin = quantization_points.min(dim=0).values  # (D,)
+    cmax = quantization_points.max(dim=0).values  # (D,)
+    extent = cmax - cmin
+    if isotropic:
+        extent = extent.amax().expand(D)
+    # Preserve every representable nonzero extent. Constant axes have a zero
+    # numerator, so replacing only their zero denominator maps them to zero.
+    safe_extent = torch.where(extent != 0, extent, torch.ones_like(extent))
+    coords = (
+        ((quantization_points - cmin) / safe_extent * max_val).long().clamp(0, max_val)
+    )  # (N, D)
 
     ### Bit-interleave all dimensions: bit b of dim d -> position b*D + d.
-    if device.type == "cuda":
-        # CUDA is launch-bound in the bit loop below. Materializing all bits at
-        # once trades a modest temporary for far fewer kernel launches.
-        bit_offsets = torch.arange(n_bits, dtype=torch.int64, device=device)
-        dim_offsets = torch.arange(D, dtype=torch.int64, device=device)
-        bits = (coords.unsqueeze(-1) >> bit_offsets) & 1  # (N, D, n_bits)
-        shifts = bit_offsets.view(1, 1, -1) * D + dim_offsets.view(1, -1, 1)
-        return (bits << shifts).reshape(N, -1).sum(dim=1)
+    dim_offsets = torch.arange(D, dtype=torch.int64, device=device)  # (D,)
+    spread_steps = _MORTON_SPREAD_STEPS.get(D)
+    if spread_steps is not None:
+        # Spread every coordinate's bits D apart in a few whole-tensor steps,
+        # then shift dimension d by d. The dimensions' bits do not overlap, so
+        # the sum is their bitwise OR. Temporaries are O(N * D), and the number
+        # of kernel launches depends on neither N nor n_bits.
+        for shift, mask in spread_steps:
+            coords = (coords | (coords << shift)) & mask
+        return (coords << dim_offsets).sum(dim=1)
 
     code = torch.zeros(N, dtype=torch.int64, device=device)
-    dim_offsets = torch.arange(D, dtype=torch.int64, device=device)  # (D,)
     for b in range(n_bits):
         bits = (coords >> b) & 1  # (N, D) - extract bit b from every dim
         code += (bits << (b * D + dim_offsets)).sum(dim=1)  # (N,)
@@ -147,15 +196,17 @@ def _expand_leaf_hits(
     counts = leaf_count[leaf_node_indices]  # (n_hits,)
     device = leaf_query_indices.device
 
-    if int(counts.sum()) == 0:
-        return (
-            torch.empty(0, dtype=torch.long, device=device),
-            torch.empty(0, dtype=torch.long, device=device),
-        )
-
+    # repeat_interleave already materializes the expanded length, so reuse its shape
+    # (no host sync) for both the empty-check and _ragged_arange's ``total`` -- this
+    # replaces an int(counts.sum()) sync and a second sync inside _ragged_arange.
     expanded_queries = torch.repeat_interleave(leaf_query_indices, counts)
+    total = expanded_queries.shape[0]
 
-    sorted_positions, _ = _ragged_arange(starts, counts)
+    if total == 0:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty
+
+    sorted_positions, _ = _ragged_arange(starts, counts, total=total)
     expanded_cells = sorted_cell_order[sorted_positions]
 
     return expanded_queries, expanded_cells
@@ -201,13 +252,22 @@ def _compute_leaf_aabbs(
     dtype = sorted_aabb_min.dtype
     n_leaf_segs = len(leaf_seg_starts)
 
-    if int(leaf_seg_sizes.sum()) == 0 or n_leaf_segs == 0:
+    # ``n_leaf_segs == 0`` is a host-side shape read (no sync). The former
+    # ``int(leaf_seg_sizes.sum()) == 0`` guard is dropped: leaf segments always
+    # hold >= 1 cell, so the sum is > 0 whenever there is any segment, making
+    # the check both redundant and a host-device synchronization.
+    if n_leaf_segs == 0:
         return (
             torch.empty((0, D), dtype=dtype, device=device),
             torch.empty((0, D), dtype=dtype, device=device),
         )
 
-    cell_pos, seg_ids = _ragged_arange(leaf_seg_starts, leaf_seg_sizes)
+    # Every sorted cell belongs to exactly one leaf, so the total expanded
+    # length equals the number of sorted cells -- a host-known shape. Passing it
+    # avoids ``_ragged_arange``'s internal ``arange(counts.sum())`` sync.
+    cell_pos, seg_ids = _ragged_arange(
+        leaf_seg_starts, leaf_seg_sizes, total=sorted_aabb_min.shape[0]
+    )
 
     cell_mins = sorted_aabb_min[cell_pos]  # (total_cells, D)
     cell_maxs = sorted_aabb_max[cell_pos]  # (total_cells, D)
@@ -226,9 +286,12 @@ def _compute_leaf_aabbs(
 # BVH tensorclass
 # ---------------------------------------------------------------------------
 
+# Queries per BVH traversal for eager CPU queries: bounds the traversal
+# frontier's memory, which otherwise grows with the number of queries.
+_QUERY_CHUNK_SIZE = 32768
 
-@tensorclass
-class BVH:
+
+class BVH(TensorClass):
     """Bounding Volume Hierarchy for efficient spatial queries.
 
     The BVH is stored as flat tensors for GPU compatibility, avoiding
@@ -268,8 +331,18 @@ class BVH:
 
     Examples
     --------
+    >>> import torch
+    >>> from physicsnemo.mesh import Mesh
+    >>> mesh = Mesh(
+    ...     points=torch.tensor(
+    ...         [[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 2.0], [4.0, 0.0]]
+    ...     ),
+    ...     cells=torch.tensor([[0, 1, 2], [1, 4, 3]]),
+    ... )
     >>> bvh = BVH.from_mesh(mesh)
-    >>> candidates = bvh.find_candidate_cells(query_points)
+    >>> query_points = torch.tensor([[0.5, 0.5], [3.5, 0.2], [9.0, 9.0]])
+    >>> bvh.find_candidate_cells(query_points).to_list()
+    [[0], [1], []]
     """
 
     node_aabb_min: Float[torch.Tensor, "n_nodes n_spatial_dims"]
@@ -298,7 +371,7 @@ class BVH:
         return self.node_aabb_min.device
 
     @classmethod
-    def from_mesh(cls, mesh: "Mesh", leaf_size: int = 8) -> "BVH":
+    def from_mesh(cls, mesh: "Mesh", leaf_size: int = 1) -> "BVH":
         """Construct a BVH from a mesh using morton-code LBVH.
 
         Cells are sorted by the morton code of their centroids, then the tree
@@ -313,8 +386,11 @@ class BVH:
         mesh : Mesh
             The mesh to build the BVH for.
         leaf_size : int, optional
-            Maximum number of cells per leaf node. Larger values reduce tree
-            depth and memory at the cost of more candidate cells per query hit.
+            Maximum number of cells per leaf node. The default of 1 minimizes
+            candidate cells per query hit but maximizes node count
+            (``2 * n_cells - 1`` nodes) and tree depth. Larger values reduce
+            build time and memory at the cost of more candidate cells per
+            query hit.
 
         Returns
         -------
@@ -359,104 +435,26 @@ class BVH:
         sorted_aabb_min = cell_aabb_min[sorted_order]  # (n_cells, D)
         sorted_aabb_max = cell_aabb_max[sorted_order]  # (n_cells, D)
 
-        ### Pre-allocate node storage with tight upper bound
-        # Midpoint splits guarantee min leaf size of (leaf_size + 1) // 2,
-        # bounding the maximum number of leaves (and thus total nodes).
-        min_cells_per_leaf = max(1, (leaf_size + 1) // 2)
-        max_leaves = (n_cells + min_cells_per_leaf - 1) // min_cells_per_leaf
-        max_nodes = max(1, 2 * max_leaves - 1)
+        ### Build the shared morton-LBVH node topology over the sorted cells.
+        topo = build_lbvh_topology(n_cells, leaf_size, device)
 
+        ### Fill leaf AABBs from per-cell bounds (segmented reduction), then
+        # propagate bottom-up so each internal node bounds its two children.
         node_aabb_min_buf = torch.full(
-            (max_nodes, D), float("inf"), dtype=dtype, device=device
+            (topo.max_nodes, D), float("inf"), dtype=dtype, device=device
         )
         node_aabb_max_buf = torch.full(
-            (max_nodes, D), float("-inf"), dtype=dtype, device=device
+            (topo.max_nodes, D), float("-inf"), dtype=dtype, device=device
         )
-        node_left_child = torch.full((max_nodes,), -1, dtype=torch.long, device=device)
-        node_right_child = torch.full((max_nodes,), -1, dtype=torch.long, device=device)
-        leaf_start_buf = torch.full((max_nodes,), -1, dtype=torch.long, device=device)
-        leaf_count_buf = torch.zeros(max_nodes, dtype=torch.long, device=device)
+        seg_min, seg_max = _compute_leaf_aabbs(
+            topo.leaf_starts, topo.leaf_sizes, sorted_aabb_min, sorted_aabb_max
+        )
+        node_aabb_min_buf[topo.leaf_node_ids] = seg_min
+        node_aabb_max_buf[topo.leaf_node_ids] = seg_max
 
-        # ---------------------------------------------------------------
-        # Phase 1: Top-down construction (O(log N) iterations)
-        # ---------------------------------------------------------------
-        # Each segment is a contiguous range [start, end) in the sorted
-        # cell array, associated with a BVH node.
-
-        seg_starts = torch.tensor([0], dtype=torch.long, device=device)
-        seg_ends = torch.tensor([n_cells], dtype=torch.long, device=device)
-        seg_node_ids = torch.tensor([0], dtype=torch.long, device=device)
-        node_count = 1  # root already allocated
-
-        # Track internal nodes per level for the bottom-up AABB pass
-        internal_nodes_per_level: list[torch.Tensor] = []
-
-        while len(seg_starts) > 0:
-            seg_sizes = seg_ends - seg_starts  # (n_segs,)
-
-            ### Classify segments as leaf or internal
-            is_leaf_seg = seg_sizes <= leaf_size
-            is_internal_seg = ~is_leaf_seg
-
-            ### Process leaf segments: record ranges and compute AABBs
-            leaf_indices = torch.where(is_leaf_seg)[0]
-            if len(leaf_indices) > 0:
-                leaf_nids = seg_node_ids[leaf_indices]
-                l_starts = seg_starts[leaf_indices]
-                l_sizes = seg_sizes[leaf_indices]
-
-                leaf_start_buf[leaf_nids] = l_starts
-                leaf_count_buf[leaf_nids] = l_sizes
-
-                # Segmented AABB reduction (total work across all levels = O(N))
-                seg_min, seg_max = _compute_leaf_aabbs(
-                    l_starts, l_sizes, sorted_aabb_min, sorted_aabb_max
-                )
-                node_aabb_min_buf[leaf_nids] = seg_min
-                node_aabb_max_buf[leaf_nids] = seg_max
-
-            ### Process internal segments: split at midpoint, assign children
-            internal_indices = torch.where(is_internal_seg)[0]
-            if len(internal_indices) == 0:
-                break
-
-            int_starts = seg_starts[internal_indices]
-            int_ends = seg_ends[internal_indices]
-            int_sizes = seg_sizes[internal_indices]
-            int_node_ids = seg_node_ids[internal_indices]
-
-            midpoints = int_starts + int_sizes // 2
-
-            # Assign child node IDs (breadth-first within each level)
-            n_internal = len(internal_indices)
-            left_ids = (
-                node_count
-                + torch.arange(n_internal, dtype=torch.long, device=device) * 2
-            )
-            right_ids = left_ids + 1
-            node_count += 2 * n_internal
-
-            # Record parent-child links
-            node_left_child[int_node_ids] = left_ids
-            node_right_child[int_node_ids] = right_ids
-
-            # Track for bottom-up pass
-            internal_nodes_per_level.append(int_node_ids)
-
-            # Prepare next level: left children then right children
-            seg_starts = torch.cat([int_starts, midpoints])
-            seg_ends = torch.cat([midpoints, int_ends])
-            seg_node_ids = torch.cat([left_ids, right_ids])
-
-        # ---------------------------------------------------------------
-        # Phase 2: Bottom-up AABB propagation (O(log N) iterations)
-        # ---------------------------------------------------------------
-        # Internal node AABB = union of its two children's AABBs.
-        # Process from deepest internal level to root.
-
-        for level_node_ids in reversed(internal_nodes_per_level):
-            left = node_left_child[level_node_ids]
-            right = node_right_child[level_node_ids]
+        for level_node_ids in reversed(topo.internal_nodes_per_level):
+            left = topo.left_child[level_node_ids]
+            right = topo.right_child[level_node_ids]
             node_aabb_min_buf[level_node_ids] = torch.minimum(
                 node_aabb_min_buf[left], node_aabb_min_buf[right]
             )
@@ -465,13 +463,14 @@ class BVH:
             )
 
         ### Trim to actual node count
+        node_count = topo.node_count
         return cls(
             node_aabb_min=node_aabb_min_buf[:node_count],
             node_aabb_max=node_aabb_max_buf[:node_count],
-            node_left_child=node_left_child[:node_count],
-            node_right_child=node_right_child[:node_count],
-            leaf_start=leaf_start_buf[:node_count],
-            leaf_count=leaf_count_buf[:node_count],
+            node_left_child=topo.left_child[:node_count],
+            node_right_child=topo.right_child[:node_count],
+            leaf_start=topo.leaf_start[:node_count],
+            leaf_count=topo.leaf_count[:node_count],
             sorted_cell_order=sorted_order,
         )
 
@@ -575,19 +574,24 @@ class BVH:
 
         ### Iterative traversal: one iteration per tree level
         while len(current_query_indices) > 0:
-            ### Vectorized AABB containment test for all active pairs
-            batch_points = query_points[current_query_indices]  # (n_active, D)
-            batch_min = self.node_aabb_min[current_node_indices]
-            batch_max = self.node_aabb_max[current_node_indices]
+            ### Vectorized AABB containment test for all active pairs, one
+            # spatial dimension at a time so temporaries are (n_active,) only
+            inside = None
+            for d in range(query_points.shape[1]):
+                p = query_points[:, d][current_query_indices]
+                ok = (
+                    p >= self.node_aabb_min[:, d][current_node_indices] - aabb_tolerance
+                ) & (
+                    p <= self.node_aabb_max[:, d][current_node_indices] + aabb_tolerance
+                )
+                inside = ok if inside is None else inside & ok
+            del p, ok
 
-            inside = (
-                (batch_points >= batch_min - aabb_tolerance)
-                & (batch_points <= batch_max + aabb_tolerance)
-            ).all(dim=1)
-
-            ### Filter to intersecting pairs only
+            ### Filter to intersecting pairs only; free the old frontier now so
+            # it is never alive together with the next one
             hit_query = current_query_indices[inside]
             hit_node = current_node_indices[inside]
+            del current_query_indices, current_node_indices, inside
 
             if len(hit_query) == 0:
                 break
@@ -615,6 +619,7 @@ class BVH:
             is_internal = ~is_leaf
             int_query = hit_query[is_internal]
             int_node = hit_node[is_internal]
+            del hit_query, hit_node, hit_leaf_count, is_leaf, is_internal
 
             # Enforce max_candidates limit
             if max_candidates_per_point is not None and len(int_query) > 0:
@@ -625,26 +630,13 @@ class BVH:
             if len(int_query) == 0:
                 break
 
-            left_children = self.node_left_child[int_node]
-            right_children = self.node_right_child[int_node]
-
-            valid_left = left_children >= 0
-            valid_right = right_children >= 0
-
-            parts_q: list[torch.Tensor] = []
-            parts_n: list[torch.Tensor] = []
-            if valid_left.any():
-                parts_q.append(int_query[valid_left])
-                parts_n.append(left_children[valid_left])
-            if valid_right.any():
-                parts_q.append(int_query[valid_right])
-                parts_n.append(right_children[valid_right])
-
-            if parts_q:
-                current_query_indices = torch.cat(parts_q)
-                current_node_indices = torch.cat(parts_n)
-            else:
-                break
+            # Every internal node of the LBVH (build_lbvh_topology) has two
+            # valid children, so the next frontier needs no -1 filtering.
+            current_query_indices = int_query.repeat(2)
+            current_node_indices = torch.cat(
+                [self.node_left_child[int_node], self.node_right_child[int_node]]
+            )
+            del int_query, int_node
 
         if all_query_indices_list:
             return torch.cat(all_query_indices_list), torch.cat(all_cell_indices_list)
@@ -660,7 +652,8 @@ class BVH:
         r"""Find candidate cells that might contain each query point.
 
         Uses batched iterative BVH traversal where all queries are processed
-        simultaneously in a vectorized manner.
+        simultaneously in a vectorized manner. CPU queries outside
+        ``torch.compile`` are traversed in bounded-size slices to bound memory.
 
         Parameters
         ----------
@@ -690,12 +683,36 @@ class BVH:
         (:math:`O(\log N)` iterations).
         """
         self._validate_query_points(query_points)
-        all_q, all_c = self._traverse(
-            query_points,
-            max_candidates_per_point,
-            aabb_tolerance,
-        )
         n_queries = query_points.shape[0]
+        # CUDA does not slice: each traversal level synchronizes with the host
+        # several times, so slicing multiplies those syncs and kernel launches
+        # by the number of slices (about 30x slower validate at 10M cells).
+        if (
+            not torch.compiler.is_compiling()
+            and query_points.device.type == "cpu"
+            and n_queries > _QUERY_CHUNK_SIZE
+        ):
+            ### Traverse fixed-size query slices. Each query's candidates (and its
+            # max_candidates cutoff) are independent of the other queries, and
+            # the adjacency sorts pairs by (query, cell), so the result is the same.
+            parts_q: list[torch.Tensor] = []
+            parts_c: list[torch.Tensor] = []
+            for start in range(0, n_queries, _QUERY_CHUNK_SIZE):
+                chunk_q, chunk_c = self._traverse(
+                    query_points[start : start + _QUERY_CHUNK_SIZE],
+                    max_candidates_per_point,
+                    aabb_tolerance,
+                )
+                parts_q.append(chunk_q + start)
+                parts_c.append(chunk_c)
+            all_q, all_c = torch.cat(parts_q), torch.cat(parts_c)
+            del parts_q, parts_c
+        else:
+            all_q, all_c = self._traverse(
+                query_points,
+                max_candidates_per_point,
+                aabb_tolerance,
+            )
         adjacency = build_adjacency_from_pairs(
             source_indices=all_q,
             target_indices=all_c,

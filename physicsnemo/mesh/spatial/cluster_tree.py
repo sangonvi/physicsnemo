@@ -1,0 +1,1922 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Spatial cluster tree for dual-tree Barnes-Hut acceleration.
+
+This module provides a GPU-compatible hierarchical spatial decomposition over a
+set of points, designed for dual-tree Barnes-Hut acceleration of
+kernel-summation and attention-style operators (e.g. GLOBE's field kernels and
+mesh attention layers).
+Trees are built over both source and target points.  The dual-tree traversal
+classifies (target_node, source_node) pairs as near-field or far-field:
+
+- **Near-field**: both nodes are leaves and nearby - expand to individual
+  (target, source) pairs for exact kernel evaluation.
+- **Far-field**: nodes are well-separated - evaluate the kernel ONCE at the
+  node centroids and broadcast the result to all targets in the target node.
+
+Far-field node pairs make the number of far-field kernel evaluations O(N)
+instead of the O(N log N) of single-tree Barnes-Hut. With
+``expand_far_targets=True`` every target is evaluated individually again, so
+the evaluations are O(N log N), and only the source side is approximated.
+For scattered targets with no tree of their own (volume prediction points),
+:meth:`ClusterTree.find_point_interaction_pairs` walks the source tree once
+per target point: each point's plan depends on the tree and the point alone,
+and a leaf of far-apart points no longer drags its neighbours' sources into
+the exact stream.
+
+Approximation error has three sources. The opening angle ``theta`` bounds the
+first two: replacing a source node by a monopole at its centroid, and, without
+``expand_far_targets``, evaluating a target node at its centroid, which is
+first order in ``D_T / r`` and piecewise constant over the node. The third is
+replacing the sources' features (normals, latents) by their node average,
+which is exact for kernels linear in those features and otherwise grows with
+how much they vary inside the node; ``theta`` does not bound it. A node that
+spans both faces of a thin body, for example, averages opposite normals.
+``find_dual_interaction_pairs(source_admissible=...)`` keeps chosen nodes exact.
+
+Construction sorts the points by Morton code and splits the sorted ranges
+recursively (:mod:`physicsnemo.mesh.spatial._lbvh`), then fills leaf AABBs from
+the points and propagates them bottom up. By default the splits follow Morton
+cells, on a grid with cubic cells, which keeps the boxes tight;
+``split="midpoint"`` reproduces the count-midpoint trees of
+:mod:`physicsnemo.mesh.spatial.bvh`. ClusterTree stores additional per-node
+fields (diameter, subtree ranges, total areas) needed for the opening
+criterion, dual-tree traversal, and far-field monopole approximation.
+"""
+
+import logging
+from typing import Literal, NamedTuple, Sequence
+
+import torch
+import torch.nn.functional as F
+from jaxtyping import Float, Int
+from tensordict import TensorClass, TensorDict
+from torch.profiler import record_function
+
+from physicsnemo.mesh.spatial._lbvh import (
+    LBVHTopology,
+    build_lbvh_topology,
+    build_morton_topology,
+)
+from physicsnemo.mesh.spatial._ragged import _ragged_arange
+from physicsnemo.mesh.spatial.bvh import _compute_morton_codes
+
+logger = logging.getLogger("mesh.spatial.cluster_tree")
+
+#: Minimum child size, as a divisor of the parent size, for ``split="morton"``.
+_MORTON_BALANCE = 4
+
+
+# ---------------------------------------------------------------------------
+# InteractionPlan: the output of tree traversal
+# ---------------------------------------------------------------------------
+
+
+class DualInteractionPlan(TensorClass):
+    r"""Result of a dual-tree Barnes-Hut traversal: four categories of
+    interactions that together cover all source contributions for every
+    target point.
+
+    **(near, near)**: ``(near_target_ids[i], near_source_ids[i])`` are
+    individual target-source pairs requiring exact kernel evaluation.
+
+    **(far, far)**: ``(far_target_node_ids[i], far_source_node_ids[i])``
+    are node-to-node pairs where the kernel is evaluated ONCE at the
+    node centroids and the result is broadcast to all individual targets
+    in the target node.
+
+    **(near, far)**: ``(nf_target_ids[i], nf_source_node_ids[i])`` are
+    individual target points paired with source nodes.  The kernel is
+    evaluated at ``(target_point, source_centroid)`` using the source
+    node's monopole approximation.  No target-side broadcast.
+
+    **(far, near)**: ``(fn_target_node_ids[i], fn_source_ids[i])`` are
+    target nodes paired with individual source points.  The kernel is
+    evaluated at ``(target_centroid, source_point)`` using exact source
+    data, then broadcast to stage-1 survivor targets via the
+    ``fn_broadcast_*`` mapping.
+
+    All index tensors are ``int64`` on the same device as the tree.
+    """
+
+    near_target_ids: Int[torch.Tensor, " n_near"]
+    near_source_ids: Int[torch.Tensor, " n_near"]
+    far_target_node_ids: Int[torch.Tensor, " n_far_nodes"]
+    far_source_node_ids: Int[torch.Tensor, " n_far_nodes"]
+    nf_target_ids: Int[torch.Tensor, " n_nf"]
+    nf_source_node_ids: Int[torch.Tensor, " n_nf"]
+    fn_target_node_ids: Int[torch.Tensor, " n_fn"]
+    fn_source_ids: Int[torch.Tensor, " n_fn"]
+    fn_broadcast_targets: Int[torch.Tensor, " n_fn_bcast"]
+    fn_broadcast_starts: Int[torch.Tensor, " n_fn"]
+    fn_broadcast_counts: Int[torch.Tensor, " n_fn"]
+    # Broadcasts expanded at plan time (data-dependent sizes), so kernel
+    # evaluation needs no host sync.
+    far_broadcast_target_ids: Int[torch.Tensor, " n_far_bcast"]
+    far_broadcast_pair_ids: Int[torch.Tensor, " n_far_bcast"]
+    fn_expanded_target_ids: Int[torch.Tensor, " n_fn_expanded"]
+    fn_expanded_pair_ids: Int[torch.Tensor, " n_fn_expanded"]
+
+    @property
+    def n_near(self) -> int:
+        """Number of (near,near) exact individual interaction pairs."""
+        return self.near_target_ids.shape[0]
+
+    @property
+    def n_far_nodes(self) -> int:
+        """Number of (far,far) node-to-node pairs (each = one kernel eval)."""
+        return self.far_target_node_ids.shape[0]
+
+    @property
+    def n_nf(self) -> int:
+        """Number of (near,far) target-point-to-source-node pairs."""
+        return self.nf_target_ids.shape[0]
+
+    @property
+    def n_fn(self) -> int:
+        """Number of (far,near) target-node-to-source-point pairs."""
+        return self.fn_target_node_ids.shape[0]
+
+    def validate(self) -> None:
+        """Check internal consistency of the interaction plan.
+
+        Verifies shape pairing, non-negativity, and fn_broadcast bounds.
+        Raises ``ValueError`` on any inconsistency.  Intended to be called
+        behind a ``not torch.compiler.is_compiling()`` guard so it is
+        zero-cost under ``torch.compile``.
+
+        Raises
+        ------
+        ValueError
+            If any internal consistency check fails.
+        """
+        ### Shape pairing: matched tensor pairs must have identical lengths
+        pairs: list[tuple[str, torch.Tensor, str, torch.Tensor]] = [
+            (
+                "near_target_ids",
+                self.near_target_ids,
+                "near_source_ids",
+                self.near_source_ids,
+            ),
+            (
+                "far_target_node_ids",
+                self.far_target_node_ids,
+                "far_source_node_ids",
+                self.far_source_node_ids,
+            ),
+            (
+                "nf_target_ids",
+                self.nf_target_ids,
+                "nf_source_node_ids",
+                self.nf_source_node_ids,
+            ),
+            (
+                "fn_target_node_ids",
+                self.fn_target_node_ids,
+                "fn_source_ids",
+                self.fn_source_ids,
+            ),
+        ]
+        for name_a, a, name_b, b in pairs:
+            if a.shape != b.shape:
+                raise ValueError(
+                    f"Shape mismatch: {name_a}.shape={a.shape!r} != "
+                    f"{name_b}.shape={b.shape!r}"
+                )
+
+        ### fn_broadcast tensors must be consistently sized AND non-negative.
+        n_fn = self.fn_source_ids.shape[0]
+        for name, tensor in [
+            ("fn_broadcast_starts", self.fn_broadcast_starts),
+            ("fn_broadcast_counts", self.fn_broadcast_counts),
+        ]:
+            if tensor.shape != (n_fn,):
+                raise ValueError(f"{name}.shape={tensor.shape!r}, expected ({n_fn},)")
+            if tensor.numel() > 0 and (tensor < 0).any():
+                raise ValueError(f"{name} contains negative values")
+
+        ### fn_broadcast bounds: every (start, count) range with count > 0
+        ### must fit within fn_broadcast_targets.  Zero-count entries are
+        ### no-ops whose starts are never dereferenced.
+        if n_fn > 0:
+            nonzero = self.fn_broadcast_counts > 0
+            if nonzero.any():
+                ends = (
+                    self.fn_broadcast_starts[nonzero]
+                    + self.fn_broadcast_counts[nonzero]
+                )
+                max_end = ends.max().item()
+                bcast_len = self.fn_broadcast_targets.shape[0]
+                if max_end > bcast_len:
+                    raise ValueError(
+                        f"fn_broadcast out of bounds: max(starts + counts)="
+                        f"{max_end} > fn_broadcast_targets.shape[0]={bcast_len}"
+                    )
+
+
+class PointInteractionPlan(TensorClass):
+    r"""Result of a single-tree Barnes-Hut walk from individual target points
+    (:meth:`ClusterTree.find_point_interaction_pairs`): two categories of
+    interactions that together cover all source contributions for every
+    target point exactly once.
+
+    **near**: ``(near_target_ids[i], near_source_ids[i])`` are individual
+    target-source pairs requiring exact kernel evaluation.
+
+    **far**: ``(far_target_ids[i], far_source_node_ids[i])`` are individual
+    target points paired with source nodes. The kernel is evaluated at
+    ``(target_point, source_centroid)`` using the source node's aggregates;
+    there is no target-side approximation of any kind.
+
+    Both streams are in traversal order; the entries of one target are not
+    contiguous. All index tensors are ``int64`` on the same device as the tree.
+    """
+
+    near_target_ids: Int[torch.Tensor, " n_near"]
+    near_source_ids: Int[torch.Tensor, " n_near"]
+    far_target_ids: Int[torch.Tensor, " n_far"]
+    far_source_node_ids: Int[torch.Tensor, " n_far"]
+
+    @property
+    def n_near(self) -> int:
+        """Number of exact individual (target, source) pairs."""
+        return self.near_target_ids.shape[0]
+
+    @property
+    def n_far(self) -> int:
+        """Number of (target point, source node) pairs (each = one kernel eval)."""
+        return self.far_target_ids.shape[0]
+
+    def validate(self) -> None:
+        """Check internal consistency: paired shapes and non-negative indices.
+
+        Raises
+        ------
+        ValueError
+            If any internal consistency check fails.
+        """
+        for name_a, a, name_b, b in (
+            (
+                "near_target_ids",
+                self.near_target_ids,
+                "near_source_ids",
+                self.near_source_ids,
+            ),
+            (
+                "far_target_ids",
+                self.far_target_ids,
+                "far_source_node_ids",
+                self.far_source_node_ids,
+            ),
+        ):
+            if a.shape != b.shape:
+                raise ValueError(
+                    f"Shape mismatch: {name_a}.shape={a.shape!r} != "
+                    f"{name_b}.shape={b.shape!r}"
+                )
+            for name, t in ((name_a, a), (name_b, b)):
+                if t.numel() > 0 and (t < 0).any():
+                    raise ValueError(f"{name} contains negative values")
+
+
+class _ExpandedLeafHits(NamedTuple):
+    """Per-iteration output of :func:`_expand_dual_leaf_hits`.
+
+    Three of the four interaction streams are returned in
+    *deferred-compaction* form: the per-element tensor is unfiltered
+    (length ``t_full`` or ``s_full``) and accompanied by a boolean
+    validity mask, so the caller can amortise compaction across all
+    traversal iterations into a single boolean indexing per stream.
+
+    Fields
+    ------
+    near_tgts, near_srcs : Int[Tensor, " n_near"]
+        (near, near) Cartesian-product pairs.  Already compacted -
+        ``_ragged_arange`` sized the output by data anyway.
+    nf_tgts, nf_snids : Int[Tensor, " t_full"]
+        (near, far) target IDs / source-node IDs, length :math:`T_\\text{full}
+        = \\sum t_\\text{counts}`.
+    nf_validity : Bool[Tensor, " t_full"]
+        Mask selecting the (near, far) entries.  Equals ``target_is_far``.
+    fn_sids, fn_tnids : Int[Tensor, " s_full"]
+        (far, near) source IDs / target-node IDs, length :math:`S_\\text{full}
+        = \\sum s_\\text{counts}`.
+    fn_validity : Bool[Tensor, " s_full"]
+        Mask selecting the (far, near) entries.  Equals ``source_is_far``.
+    fn_bcast_starts, fn_bcast_counts : Int[Tensor, " s_full"]
+        Per-source start/count into ``fn_bcast_targets``.  Aligned with
+        the fn stream; filter by ``fn_validity``.  Non-fn entries have
+        arithmetically defined but unused values.
+    fn_bcast_targets : Int[Tensor, " t_full"]
+        Active survivor target IDs sorted by leaf pair, *sentinel-padded*
+        at the tail.  Compact via ``fn_bcast_targets_validity``.
+    fn_bcast_targets_validity : Bool[Tensor, " t_full"]
+        Mask selecting active (non-sentinel) entries.
+    """
+
+    near_tgts: torch.Tensor
+    near_srcs: torch.Tensor
+    nf_tgts: torch.Tensor
+    nf_snids: torch.Tensor
+    nf_validity: torch.Tensor
+    fn_sids: torch.Tensor
+    fn_tnids: torch.Tensor
+    fn_validity: torch.Tensor
+    fn_bcast_starts: torch.Tensor
+    fn_bcast_counts: torch.Tensor
+    fn_bcast_targets: torch.Tensor
+    fn_bcast_targets_validity: torch.Tensor
+
+    @classmethod
+    def empty(cls, device: torch.device) -> "_ExpandedLeafHits":
+        """All-empty hits, used as the ``n_pairs == 0`` short-circuit."""
+        el = torch.empty(0, dtype=torch.long, device=device)
+        eb = torch.empty(0, dtype=torch.bool, device=device)
+        return cls(
+            near_tgts=el,
+            near_srcs=el.clone(),
+            nf_tgts=el.clone(),
+            nf_snids=el.clone(),
+            nf_validity=eb,
+            fn_sids=el.clone(),
+            fn_tnids=el.clone(),
+            fn_validity=eb.clone(),
+            fn_bcast_starts=el.clone(),
+            fn_bcast_counts=el.clone(),
+            fn_bcast_targets=el.clone(),
+            fn_bcast_targets_validity=eb.clone(),
+        )
+
+
+def _expand_dual_leaf_hits(
+    target_leaf_ids: Int[torch.Tensor, " n_leaf_pairs"],
+    source_leaf_ids: Int[torch.Tensor, " n_leaf_pairs"],
+    target_tree: "ClusterTree",
+    source_tree: "ClusterTree",
+    theta: float,
+    t_total: int | None = None,
+    s_total: int | None = None,
+    source_admissible: torch.Tensor | None = None,
+    target_approximation: bool = True,
+) -> _ExpandedLeafHits:
+    """Expand ``(target_leaf, source_leaf)`` pairs with two-stage filtering.
+
+    Applies two sequential per-point tests to classify each (target, source)
+    interaction within a leaf pair:
+
+    **Stage 1 (per-target)**: Test each target against the source leaf AABB.
+    Targets that pass become **(near, far)** - they use the source monopole.
+    Targets that fail are "survivors" and proceed to stage 2.
+
+    **Stage 2 (per-source)**: Test each source against the target leaf AABB.
+    Sources that pass become **(far, near)** - evaluated at the target
+    centroid and broadcast to all survivors.  Sources that fail produce
+    **(near, near)** Cartesian product pairs with the survivors.
+
+    The two stages are independent (different AABBs) and sequential (stage 2
+    only applies to survivors), so no (target, source) pair is double-counted.
+
+    Three of the four output streams are returned in **deferred-compaction**
+    form on the result struct: the per-element tensor is unfiltered (length
+    ``t_full`` or ``s_full``) and accompanied by a boolean validity mask.
+    The caller accumulates these across traversal iterations and does ONE
+    boolean compaction at the end - mirroring the pattern already used for
+    the far-field stream in ``find_dual_interaction_pairs``.  This
+    eliminates the five per-iter ``aten::nonzero`` syncs that the previous
+    eagerly-filtered version paid (one each for ``target_is_far``,
+    ``~target_is_far``, ``source_is_far``, ``fn_active_mask``, and
+    ``~source_is_far``).
+
+    Returns
+    -------
+    _ExpandedLeafHits
+        See :class:`_ExpandedLeafHits` for the per-field shapes and
+        deferred-compaction protocol.
+    """
+    device = target_leaf_ids.device
+    theta_sq = theta * theta
+    n_pairs = target_leaf_ids.shape[0]
+
+    ### The early-return guard is a Python ``int`` comparison on a shape
+    ### attribute - zero CUDA cost.  It matters because in the early
+    ### traversal iterations (top-of-tree) there are typically no
+    ### leaf-leaf pairs yet, and without this guard the three
+    ### ``_ragged_arange`` calls below would each pay a
+    ### ``torch.arange(scalar_tensor)`` host sync to size their empty
+    ### output.  Saves ~3 syncs * (number of leaf-leaf-free early iters)
+    ### per traversal.
+    if n_pairs == 0:
+        return _ExpandedLeafHits.empty(device)
+
+    ### The rest of this function is intentionally written without
+    ### ``if X.any():`` / ``int(X.sum())`` early-exit branches AND without
+    ### ``X.nonzero()`` compactions.  Each such call was a CPU-GPU sync
+    ### point in the dual-traversal hot loop; the sync count was the
+    ### dominant CPU stall in profiling.  All downstream operations
+    ### (``_ragged_arange``, ``argsort``, ``scatter_add_``, ``scatter_``)
+    ### handle zero-element inputs correctly, so we let empty intermediate
+    ### tensors flow through unconditionally.
+
+    t_starts = target_tree.leaf_start[target_leaf_ids]
+    t_counts = target_tree.leaf_count[target_leaf_ids]
+    s_starts = source_tree.leaf_start[source_leaf_ids]
+    s_counts = source_tree.leaf_count[source_leaf_ids]
+
+    # ==================================================================
+    # Stage 1: per-target test against source leaf AABBs
+    # ==================================================================
+    positions_t, leaf_pair_ids_t = _ragged_arange(t_starts, t_counts, total=t_total)
+    target_point_ids = target_tree.sorted_source_order[positions_t]
+    target_pts = target_tree.source_points[target_point_ids]
+
+    src_leaf_per_target = source_leaf_ids[leaf_pair_ids_t]
+    clamped_t = torch.clamp(
+        target_pts,
+        min=source_tree.node_aabb_min[src_leaf_per_target],
+        max=source_tree.node_aabb_max[src_leaf_per_target],
+    )
+    dist_sq_t = (target_pts - clamped_t).pow(2).sum(dim=-1)
+    target_is_far = (
+        dist_sq_t * theta_sq > source_tree.node_diameter_sq[src_leaf_per_target]
+    )
+    if source_admissible is not None:
+        target_is_far = target_is_far & source_admissible[src_leaf_per_target]
+
+    ### (near, far) stream is returned unfiltered.  ``target_point_ids``,
+    ### ``src_leaf_per_target`` are length ``t_full``; the caller compacts
+    ### them with ``target_is_far`` (== ``nf_validity``) at end-of-traversal.
+
+    # ==================================================================
+    # Stage 2: per-source test against target leaf AABBs
+    # ==================================================================
+    positions_s, leaf_pair_ids_s = _ragged_arange(s_starts, s_counts, total=s_total)
+    src_point_ids = source_tree.sorted_source_order[positions_s]
+    src_pts = source_tree.source_points[src_point_ids]
+
+    tgt_leaf_per_src = target_leaf_ids[leaf_pair_ids_s]
+    clamped_s = torch.clamp(
+        src_pts,
+        min=target_tree.node_aabb_min[tgt_leaf_per_src],
+        max=target_tree.node_aabb_max[tgt_leaf_per_src],
+    )
+    dist_sq_s = (src_pts - clamped_s).pow(2).sum(dim=-1)
+    source_is_far = (
+        dist_sq_s * theta_sq > target_tree.node_diameter_sq[tgt_leaf_per_src]
+    )
+    if not target_approximation:
+        ### No (far, near) entries: every survivor meets every source exactly.
+        source_is_far = torch.zeros_like(source_is_far)
+
+    ### (far, near) stream is returned unfiltered: ``src_point_ids``,
+    ### ``tgt_leaf_per_src`` are length ``s_full``; the caller compacts
+    ### with ``source_is_far`` (== ``fn_validity``).
+
+    # ==================================================================
+    # Build (far, near) broadcast mapping (sync-free, sentinel-padded)
+    # ==================================================================
+    # ``has_fn_source[lp]`` is True iff leaf pair ``lp`` has at least one
+    # fn source (i.e., a source that passed the per-source far test).
+    # Sync-free construction: scatter ``True`` into ``has_fn_source[lp]``
+    # for every fn entry and into a sentinel slot for every non-fn entry.
+    # The original ``has_fn_source[fn_lp_ids] = True`` required a
+    # ``nonzero`` on ``source_is_far`` to compute the filtered
+    # ``fn_lp_ids``; ``torch.where`` + sentinel-slot scatter is
+    # data-flow-equivalent and pays zero CUDA syncs.
+    has_fn_source_buf = torch.zeros(n_pairs + 1, dtype=torch.bool, device=device)
+    safe_fn_lp = torch.where(
+        source_is_far,
+        leaf_pair_ids_s,
+        torch.full_like(leaf_pair_ids_s, n_pairs),
+    )
+    has_fn_source_buf.scatter_(0, safe_fn_lp, True)
+    has_fn_source = has_fn_source_buf[:n_pairs]
+
+    ### An "active" target is a stage-1 survivor whose leaf pair has at
+    ### least one fn source.  Working on the unfiltered ``leaf_pair_ids_t``
+    ### lets us build the validity mask without a ``nonzero`` over
+    ### ``~target_is_far``.
+    active_validity = (~target_is_far) & has_fn_source[leaf_pair_ids_t]
+
+    ### Sort by ``(leaf_pair_id if active else n_pairs)`` so that within
+    ### the sorted target_point_ids the active entries come first, grouped
+    ### by leaf-pair, followed by all the inactive entries (which carry the
+    ### sentinel key ``n_pairs``).  The caller drops the inactive tail via
+    ### ``fn_broadcast_targets_validity`` at end-of-traversal.
+    bcast_sort_key = torch.where(
+        active_validity,
+        leaf_pair_ids_t,
+        torch.full_like(leaf_pair_ids_t, n_pairs),
+    )
+    bcast_sort_order = bcast_sort_key.argsort(stable=True)
+    fn_broadcast_targets = target_point_ids[bcast_sort_order]
+    fn_broadcast_targets_validity = active_validity[bcast_sort_order]
+
+    ### Per-lp active count via weighted ``scatter_add_``.  Weight =
+    ### ``active_validity.long()``, so non-active entries contribute zero.
+    active_counts_per_lp = torch.zeros(n_pairs, dtype=torch.long, device=device)
+    active_counts_per_lp.scatter_add_(0, leaf_pair_ids_t, active_validity.long())
+    active_starts_per_lp = active_counts_per_lp.cumsum(0) - active_counts_per_lp
+
+    ### Return broadcast_starts/counts aligned with the *full* per-source
+    ### axis (length ``s_full``).  The caller filters by ``source_is_far``.
+    fn_broadcast_starts_full = active_starts_per_lp[leaf_pair_ids_s]
+    fn_broadcast_counts_full = active_counts_per_lp[leaf_pair_ids_s]
+
+    # ==================================================================
+    # Reduced Cartesian product: survivors × close sources only
+    # ==================================================================
+    ### Per-lp count of close sources via weighted ``scatter_add_``.
+    close_counts_per_lp = torch.zeros(n_pairs, dtype=torch.long, device=device)
+    close_counts_per_lp.scatter_add_(0, leaf_pair_ids_s, (~source_is_far).long())
+
+    ### Sort sources by ``(leaf_pair_id, source_is_far)`` so within each
+    ### lp's contiguous block the close sources come first (key
+    ### ``2*lp + 0``) followed by the far sources (key ``2*lp + 1``).
+    ### This avoids the per-iter ``(~source_is_far).nonzero()`` sync that
+    ### the previous filtered-then-sort version paid.  Stable argsort
+    ### preserves the original within-lp order of close sources, matching
+    ### the previous implementation's output element-for-element.
+    src_sort_key = leaf_pair_ids_s * 2 + source_is_far.long()
+    src_sort_order = src_sort_key.argsort(stable=True)
+    sorted_src_ids = src_point_ids[src_sort_order]
+
+    ### Start of lp's block in ``sorted_src_ids`` is the exclusive cumsum
+    ### of ``s_counts`` (the per-lp total source count, by construction).
+    total_lp_starts = s_counts.cumsum(0) - s_counts
+
+    ### Per-target close counts: gate by ``(~target_is_far).long()`` so
+    ### non-survivors get count 0 and produce no Cartesian-product output.
+    ### The block start does not depend on survivor-ness.
+    per_target_close_counts = (
+        close_counts_per_lp[leaf_pair_ids_t] * (~target_is_far).long()
+    )
+    per_target_close_starts = total_lp_starts[leaf_pair_ids_t]
+
+    ### Reuse ``_ragged_arange``'s second output (``seg_ids_nn``) as the
+    ### per-element survivor index instead of calling
+    ### ``torch.repeat_interleave(surv_point_ids, per_target_close_counts)``.
+    ### Both ops sync once to size their output; folding them into one
+    ### ``_ragged_arange`` halves that cost.  Functionally identical:
+    ### ``repeat_interleave(x, counts)[k] == x[seg_ids[k]]`` by
+    ### definition of segment ids.
+    src_positions_nn, seg_ids_nn = _ragged_arange(
+        per_target_close_starts, per_target_close_counts
+    )
+    expanded_near_tgts = target_point_ids[seg_ids_nn]
+    expanded_near_srcs = sorted_src_ids[src_positions_nn]
+
+    return _ExpandedLeafHits(
+        near_tgts=expanded_near_tgts,
+        near_srcs=expanded_near_srcs,
+        nf_tgts=target_point_ids,
+        nf_snids=src_leaf_per_target,
+        nf_validity=target_is_far,
+        fn_sids=src_point_ids,
+        fn_tnids=tgt_leaf_per_src,
+        fn_validity=source_is_far,
+        fn_bcast_starts=fn_broadcast_starts_full,
+        fn_bcast_counts=fn_broadcast_counts_full,
+        fn_bcast_targets=fn_broadcast_targets,
+        fn_bcast_targets_validity=fn_broadcast_targets_validity,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deferred-compaction helpers (used by find_dual_interaction_pairs)
+# ---------------------------------------------------------------------------
+
+
+def _compact_deferred(
+    *tensor_lists: list[torch.Tensor],
+    validity_list: list[torch.Tensor],
+    device: torch.device,
+    size: int,
+) -> tuple[torch.Tensor, ...]:
+    """Concatenate per-iter accumulators and boolean-index by validity.
+
+    Each ``tensor_lists[i]`` is the per-iter accumulator for one output
+    stream; ``validity_list`` is the shared per-iter validity mask.  All
+    accumulators must be the same length within each iteration.
+    ``size`` is the host-known number of valid entries, so no sync; the
+    integer ``keep_idx`` is computed once and reused for every stream.
+
+    The empty-``validity_list`` case (no iteration ever contributed to
+    this stream) is handled explicitly because ``torch.cat([])`` raises.
+    """
+    if not validity_list:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return tuple(empty.clone() for _ in tensor_lists)
+    keep_idx = torch.nonzero_static(torch.cat(validity_list), size=size)[:, 0]
+    return tuple(torch.cat(L)[keep_idx] for L in tensor_lists)
+
+
+def _compact_sentinel_padded(
+    padded_tensor: torch.Tensor,
+    referencing_indices: torch.Tensor,
+    validity: torch.Tensor,
+    size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compact a sentinel-padded buffer and remap referencing indices.
+
+    ``padded_tensor`` has don't-care entries wherever ``~validity``;
+    ``referencing_indices`` are integer indices into ``padded_tensor``
+    that only ever reference *valid* positions.  This returns
+    ``(padded_tensor[validity], remapped_indices)`` where the remapped
+    indices point at the same elements in the compacted buffer.
+
+    The remap is the exclusive cumsum of ``validity``: position ``p`` in
+    the padded buffer maps to ``sum(validity[:p])`` in the compacted
+    buffer, which is its slot in ``padded_tensor[validity]``.  ``size`` is
+    the host-known ``validity.sum()``, so nothing here synchronizes.
+    """
+    valid_long = validity.long()
+    new_pos = valid_long.cumsum(0) - valid_long
+    keep_idx = torch.nonzero_static(validity, size=size)[:, 0]
+    return padded_tensor[keep_idx], new_pos[referencing_indices]
+
+
+def _traversal_tables(
+    tree: "ClusterTree",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Feature-major per-node tables for :meth:`ClusterTree.find_dual_interaction_pairs`.
+
+    Returns ``box`` of shape ``(2 * D + 2, n_nodes)`` holding ``[aabb_min,
+    aabb_max, diameter, diameter_sq]`` and ``kids`` of shape ``(2, n_nodes)``
+    holding ``[left, right]``. They are gathered with ``index_select`` along
+    dim 1: row gathers ``x[idx]`` of rows that are a multiple of 16 bytes wide
+    take a vectorized CUDA path that is ~30x slower on GB300.
+    """
+    diam_sq = tree.node_diameter_sq
+    box = torch.cat(
+        [
+            tree.node_aabb_min.t(),
+            tree.node_aabb_max.t(),
+            diam_sq.sqrt()[None],
+            diam_sq[None],
+        ],
+        dim=0,
+    )
+    kids = torch.stack([tree.node_left_child, tree.node_right_child], dim=0)
+    return box, kids
+
+
+# ---------------------------------------------------------------------------
+# ClusterTree tensorclass
+# ---------------------------------------------------------------------------
+
+
+class ClusterTree(TensorClass):
+    r"""Hierarchical spatial decomposition for Barnes-Hut kernel acceleration.
+
+    Stores a binary tree over source points as flat GPU-compatible tensors;
+    every node covers a contiguous range of the Morton-sorted points.
+    The tree structure (positions, AABBs, children) is precomputable per mesh
+    geometry. Per-node source-data aggregates are recomputed whenever the source
+    features change (e.g., between communication hyperlayers).
+
+    The tree supports both boundary face centroids and prediction point clouds
+    (same construction algorithm, same data structure).
+
+    A ClusterTree can also be a forest: :meth:`merge` lays several trees end
+    to end, with their nodes and points one after another, and lists the root
+    of each in ``root_ids``. Every traversal starts from all of the roots, on
+    either side, and ``n_sources`` counts the points of every tree.
+
+    Attributes
+    ----------
+    node_aabb_min : torch.Tensor
+        AABB minimum corner per node, shape ``(n_nodes, D)``.
+    node_aabb_max : torch.Tensor
+        AABB maximum corner per node, shape ``(n_nodes, D)``.
+    node_diameter_sq : torch.Tensor
+        Squared AABB diagonal per node, shape ``(n_nodes,)``.
+    node_left_child : torch.Tensor
+        Left child index per node, ``-1`` for leaves, shape ``(n_nodes,)``.
+    node_right_child : torch.Tensor
+        Right child index per node, ``-1`` for leaves, shape ``(n_nodes,)``.
+    leaf_start : torch.Tensor
+        Start offset into ``sorted_source_order`` for leaf nodes,
+        ``-1`` for internal nodes, shape ``(n_nodes,)``.
+    leaf_count : torch.Tensor
+        Number of sources in each leaf node, ``0`` for internal nodes,
+        shape ``(n_nodes,)``.
+    node_range_start : torch.Tensor
+        Start offset into ``sorted_source_order`` for ALL nodes (both
+        leaf and internal), shape ``(n_nodes,)``.  Each node's subtree
+        covers a contiguous range in morton-sorted order.
+    node_range_count : torch.Tensor
+        Number of points in each node's subtree, shape ``(n_nodes,)``.
+        For leaves this equals ``leaf_count``; for internal nodes it
+        equals the sum of children's range counts.
+    node_total_area : torch.Tensor
+        Total source area in each node's subtree, shape ``(n_nodes,)``.
+    sorted_source_order : torch.Tensor
+        Morton-code-sorted permutation of source indices,
+        shape ``(n_sources,)``.
+    source_points : torch.Tensor
+        Original source point coordinates, shape ``(n_sources, D)``.
+    max_depth : torch.Tensor
+        Scalar tensor storing the tree depth (for fixed-iteration traversal).
+    root_ids : torch.Tensor
+        Root node of each tree, in order, shape ``(n_roots,)``: ``[0]`` for
+        a tree from :meth:`from_points`, empty for an empty tree, one per
+        nonempty tree for a forest from :meth:`merge`.
+    """
+
+    node_aabb_min: torch.Tensor
+    node_aabb_max: torch.Tensor
+    node_diameter_sq: torch.Tensor
+    node_left_child: torch.Tensor
+    node_right_child: torch.Tensor
+    leaf_start: torch.Tensor
+    leaf_count: torch.Tensor
+    node_range_start: torch.Tensor
+    node_range_count: torch.Tensor
+    node_total_area: torch.Tensor
+    sorted_source_order: torch.Tensor
+    source_points: torch.Tensor
+    max_depth: torch.Tensor
+    root_ids: torch.Tensor
+
+    @property
+    def n_nodes(self) -> int:
+        """Number of nodes in the tree."""
+        return self.node_aabb_min.shape[0]
+
+    @property
+    def n_sources(self) -> int:
+        """Number of source points."""
+        return self.sorted_source_order.shape[0]
+
+    @property
+    def n_spatial_dims(self) -> int:
+        """Spatial dimensionality."""
+        return self.node_aabb_min.shape[1]
+
+    @classmethod
+    def from_points(
+        cls,
+        points: Float[torch.Tensor, "n_points n_dims"],
+        *,
+        leaf_size: int = 1,
+        areas: Float[torch.Tensor, " n_points"] | None = None,
+        split: Literal["morton", "midpoint"] = "morton",
+    ) -> "ClusterTree":
+        r"""Build a cluster tree from a set of points via morton-code LBVH.
+
+        Parameters
+        ----------
+        points : Float[torch.Tensor, "n_points n_dims"]
+            Source point coordinates, shape :math:`(N, D)`.
+        leaf_size : int
+            Maximum sources per leaf node. Larger values produce shallower
+            trees (fewer traversal iterations) at the cost of more exact
+            near-field interactions per leaf hit.
+        areas : Float[torch.Tensor, "n_points"] or None
+            Per-source area weights used for aggregate computation. If
+            ``None``, all areas default to 1.
+        split : {"morton", "midpoint"}, optional, default="morton"
+            How ranges of Morton-sorted points are split into children.
+            ``"morton"`` sorts on a Morton grid with cubic cells and splits
+            each range at the coarsest Morton-cell boundary that leaves at
+            least a quarter of its points on each side, so nodes are compact
+            and their boxes tight. ``"midpoint"`` reproduces the trees of
+            earlier releases: a grid stretched to the bounding box on every
+            axis, and splits at the count midpoint, which cut through Morton
+            cells and give looser boxes (at the same ``theta``, about 3x more
+            interactions on a car surface and 25-40x on a 10:1:0.01 slab).
+            The stretched grid does separate the two faces of a thin body
+            aligned with an axis, so it can be more accurate there for
+            kernels that depend nonlinearly on normals; the
+            ``source_admissible`` mask of :meth:`find_dual_interaction_pairs`
+            handles such bodies in any orientation.
+
+        Returns
+        -------
+        ClusterTree
+            Constructed tree ready for traversal and aggregate computation.
+        """
+        if leaf_size < 1:
+            raise ValueError(f"leaf_size must be >= 1, got {leaf_size=!r}")
+        if split not in ("morton", "midpoint"):
+            raise ValueError(f"split must be 'morton' or 'midpoint', got {split=!r}")
+
+        n_points = points.shape[0]
+        D = points.shape[1]
+        device = points.device
+        dtype = points.dtype
+
+        if areas is None:
+            areas = torch.ones(n_points, device=device, dtype=dtype)
+
+        ### Handle empty point set
+        if n_points == 0:
+            empty_long = torch.empty(0, dtype=torch.long, device=device)
+            return cls(
+                node_aabb_min=torch.empty((0, D), dtype=dtype, device=device),
+                node_aabb_max=torch.empty((0, D), dtype=dtype, device=device),
+                node_diameter_sq=torch.empty(0, dtype=dtype, device=device),
+                node_left_child=empty_long,
+                node_right_child=empty_long,
+                leaf_start=empty_long,
+                leaf_count=empty_long,
+                node_range_start=empty_long,
+                node_range_count=empty_long,
+                node_total_area=torch.empty(0, dtype=dtype, device=device),
+                sorted_source_order=empty_long,
+                source_points=points.detach(),
+                max_depth=torch.tensor(0, dtype=torch.long, device=device),
+                root_ids=empty_long,
+                batch_size=torch.Size([]),
+            )
+
+        ### Sort points by morton code for spatial coherence. The tree is a
+        ### fixed function of the point positions, so no gradient flows into it.
+        points_detached = points.detach()
+        with record_function("cluster_tree::morton_sort"):
+            morton_codes = _compute_morton_codes(
+                points_detached, isotropic=split == "morton"
+            )
+            sorted_codes, sorted_order = morton_codes.sort(stable=True)
+            sorted_points = points_detached[sorted_order]  # (n_points, D)
+
+        ### Build the node topology over the sorted points.
+        with record_function("cluster_tree::top_down_build"):
+            if split == "morton":
+                topo = build_morton_topology(
+                    sorted_codes, leaf_size, balance=_MORTON_BALANCE
+                )
+            else:
+                topo = build_lbvh_topology(n_points, leaf_size, device)
+
+        with record_function("cluster_tree::node_boxes"):
+            aabb_min, aabb_max = _node_boxes(topo, sorted_points, leaf_size)
+            diameter_sq = (aabb_max - aabb_min).pow(2).sum(dim=-1)
+
+        ### Total area per node: a range sum of the sorted areas.
+        node_count = topo.node_count
+        range_start = topo.range_start[:node_count]
+        range_count = topo.range_count[:node_count]
+        area_prefix = F.pad(
+            torch.cumsum(areas.detach()[sorted_order].double(), dim=0), (1, 0)
+        )
+        total_area = (
+            area_prefix[range_start + range_count] - area_prefix[range_start]
+        ).to(dtype)
+
+        logger.debug(
+            "ClusterTree: %d points -> %d nodes, depth %d, leaf_size=%d",
+            n_points,
+            node_count,
+            topo.max_depth,
+            leaf_size,
+        )
+
+        return cls(
+            node_aabb_min=aabb_min,
+            node_aabb_max=aabb_max,
+            node_diameter_sq=diameter_sq,
+            node_left_child=topo.left_child[:node_count],
+            node_right_child=topo.right_child[:node_count],
+            leaf_start=topo.leaf_start[:node_count],
+            leaf_count=topo.leaf_count[:node_count],
+            node_range_start=range_start,
+            node_range_count=range_count,
+            node_total_area=total_area,
+            sorted_source_order=sorted_order,
+            source_points=points_detached,
+            max_depth=torch.full((), topo.max_depth, dtype=torch.long, device=device),
+            root_ids=torch.zeros(1, dtype=torch.long, device=device),
+            batch_size=torch.Size([]),
+        )
+
+    @classmethod
+    def merge(cls, trees: Sequence["ClusterTree"]) -> "ClusterTree":
+        r"""Combine trees into one forest.
+
+        The forest holds each tree's nodes and points after those of the
+        trees before it, with every node, range and point index shifted to
+        match, so its points are the trees' points laid end to end. Its
+        ``root_ids`` are the roots of every input, shifted the same way, so
+        merging a forest keeps all of its roots. A traversal of the forest,
+        as source or target, starts from every root and makes the same
+        decisions as one traversal per tree, in one pass: its plan is the
+        per-tree plans joined, indexing the concatenated points.
+
+        Parameters
+        ----------
+        trees : Sequence[ClusterTree]
+            Trees with the same spatial dimension, dtype and device.
+
+        Returns
+        -------
+        ClusterTree
+            The combined trees; its ``max_depth`` is the largest of theirs.
+
+        Raises
+        ------
+        ValueError
+            If ``trees`` is empty, or the trees differ in device or spatial
+            dimension.
+        TypeError
+            If the trees differ in dtype.
+
+        Examples
+        --------
+        >>> a = ClusterTree.from_points(torch.rand(30, 3))
+        >>> b = ClusterTree.from_points(torch.rand(20, 3) + 2.0)
+        >>> forest = ClusterTree.merge([a, b])
+        >>> forest.n_sources, forest.root_ids.tolist() == [0, a.n_nodes]
+        (50, True)
+        """
+        if not trees:
+            raise ValueError("merge needs at least one tree")
+        ### Checked from metadata only, so without a host sync.
+        for name, error, values in (
+            ("dtype", TypeError, [t.node_aabb_min.dtype for t in trees]),
+            ("device", ValueError, [t.node_aabb_min.device for t in trees]),
+            ("n_spatial_dims", ValueError, [t.n_spatial_dims for t in trees]),
+        ):
+            differ = [i for i, v in enumerate(values) if v != values[0]]
+            if differ:
+                raise error(
+                    f"merge needs trees of one {name}: trees {differ} differ "
+                    f"from trees[0], got {values}"
+                )
+        node_offsets: list[int] = []
+        point_offsets: list[int] = []
+        n_nodes = n_points = 0
+        for tree in trees:
+            node_offsets.append(n_nodes)
+            point_offsets.append(n_points)
+            n_nodes += tree.n_nodes
+            n_points += tree.n_sources
+
+        def shifted(name: str, offsets: list[int], *, keep_negative: bool = False):
+            parts = []
+            for tree, offset in zip(trees, offsets):
+                ids = getattr(tree, name)
+                if keep_negative:  # -1 marks "no child" / "not a leaf"
+                    ids = torch.where(ids >= 0, ids + offset, ids)
+                else:
+                    ids = ids + offset
+                parts.append(ids)
+            return torch.cat(parts)
+
+        def joined(name: str) -> torch.Tensor:
+            return torch.cat([getattr(tree, name) for tree in trees])
+
+        forest = cls(
+            node_aabb_min=joined("node_aabb_min"),
+            node_aabb_max=joined("node_aabb_max"),
+            node_diameter_sq=joined("node_diameter_sq"),
+            node_left_child=shifted(
+                "node_left_child", node_offsets, keep_negative=True
+            ),
+            node_right_child=shifted(
+                "node_right_child", node_offsets, keep_negative=True
+            ),
+            leaf_start=shifted("leaf_start", point_offsets, keep_negative=True),
+            leaf_count=joined("leaf_count"),
+            node_range_start=shifted("node_range_start", point_offsets),
+            node_range_count=joined("node_range_count"),
+            node_total_area=joined("node_total_area"),
+            sorted_source_order=shifted("sorted_source_order", point_offsets),
+            source_points=joined("source_points"),
+            max_depth=torch.stack([tree.max_depth for tree in trees]).max(),
+            root_ids=shifted("root_ids", node_offsets),
+            batch_size=torch.Size([]),
+        )
+        return forest
+
+    def compute_source_aggregates(
+        self,
+        source_points: Float[torch.Tensor, "n_sources n_dims"],
+        areas: Float[torch.Tensor, " n_sources"],
+        source_data: TensorDict | None = None,
+    ) -> "SourceAggregates":
+        r"""Compute per-node aggregate source data for far-field approximation.
+
+        Aggregates are area-weighted averages of source features within each
+        node's subtree. The ``areas`` passed to this call are authoritative for
+        both the weighted sums and their normalization; they need not match the
+        areas used to construct the tree. Per-source strengths are handled
+        separately during kernel evaluation.
+
+        Parameters
+        ----------
+        source_points : Float[torch.Tensor, "n_sources n_dims"]
+            Source coordinates, shape :math:`(N, D)`.
+        areas : Float[torch.Tensor, "n_sources"]
+            Per-source area weights, shape :math:`(N,)`.
+        source_data : TensorDict or None
+            Per-source features (normals, latents, etc.) with
+            ``batch_size=(N,)``, all of one dtype. ``None`` if no per-source
+            features.
+
+        Returns
+        -------
+        SourceAggregates
+            Per-node aggregated centroids and source data.
+
+        Raises
+        ------
+        TypeError
+            If the leaves of ``source_data`` have different dtypes.
+
+        Notes
+        -----
+        Tree topology depends on point positions, so callers may reuse a cached
+        tree with different aggregation weights. ``node_total_area`` remains
+        construction-time metadata; it is not the normalization for this
+        call's aggregates.
+        """
+        device = source_points.device
+        dtype = source_points.dtype
+        D = source_points.shape[1]
+        n_nodes = self.n_nodes
+        if n_nodes == 0:
+            return SourceAggregates(
+                node_centroid=torch.empty((0, D), dtype=dtype, device=device),
+                node_source_data=None,
+            )
+
+        ### Range-sum aggregation via morton-sorted prefix sums.
+        # Each node covers a contiguous range
+        # [node_range_start, node_range_start + node_range_count) in
+        # morton-sorted source order, so any node-subtree sum is just
+        # ``prefix[end] - prefix[start]``.  This replaces the old
+        # leaf-aggregation + bottom-up Python loop, which were the
+        # dominant CPU + GPU costs in ``compute_source_aggregates``
+        # (~2 s combined per training step in profiling).
+        #
+        # The cumsum and the range subtract are done in fp64 because fp32
+        # suffers catastrophic cancellation when ``range_sum << cumsum_total``,
+        # which is the regime of small leaves (``leaf_size=1``) in a large
+        # tree built over offset (e.g. all-positive) coordinates.  At
+        # drivaer scale (``N=1M``, coords ~5 m), fp32 leaf centroids had
+        # median ~2 % relative error and p99 ~100 % wrong.  Lifting the
+        # cumsum to fp64 brings this back to fp32 epsilon (~1e-7) and adds
+        # <1 % wall-clock to the training step (cumsum is ~2.3x slower in
+        # fp64, but cumsum is a tiny fraction of step time).  CUDA fp32
+        # cumsum is also non-deterministic across runs (pytorch#75240);
+        # fp64 cumsum is much less affected.
+        #
+        # The centroid numerators and every ``source_data`` leaf share one
+        # packed ``(N, F)`` prefix sum, scanned feature-major: on CUDA,
+        # ``cumsum`` along a non-innermost dimension runs one thread per
+        # column, serially over all ``N`` rows (12 ms for ``(80_000, 3)`` in
+        # fp64 on a GB300, against 0.24 ms along the innermost dimension).
+        # The leaves are gathered before they are packed: a gather of packed
+        # rows a multiple of 16 bytes wide is 10-20x slower on CUDA
+        # (pytorch/pytorch#200939).
+        sorted_points = source_points[self.sorted_source_order]
+        sorted_areas = areas[self.sorted_source_order]
+        packed = sorted_points
+        if source_data is not None:
+            data_flat, layout = source_data[self.sorted_source_order].pack()
+            packed = torch.cat([sorted_points, data_flat], dim=1)
+        # Both the numerator and denominator must use the call-time weights.
+        weighted_64 = (packed * sorted_areas.unsqueeze(-1)).double()
+
+        ### Leading-zero padding makes ``prefix[:, i]`` the sum of the first
+        ### ``i`` elements, so subtraction gives the half-open range sum.
+        prefix = F.pad(torch.cumsum(weighted_64.t(), dim=1), (1, 0))  # (F, N + 1)
+        area_prefix = F.pad(torch.cumsum(sorted_areas.double(), dim=0), (1, 0))
+
+        starts = self.node_range_start
+        ends = starts + self.node_range_count
+        node_total_area_64 = area_prefix[ends] - area_prefix[starts]
+        nonzero_total = node_total_area_64 != 0
+        safe_areas_64 = node_total_area_64.where(nonzero_total, 1)
+        with record_function("cluster_tree::node_means"):
+            node_means = (prefix[:, ends] - prefix[:, starts]) / safe_areas_64
+            node_means = node_means.where(nonzero_total, 0).t()  # (n_nodes, F)
+
+        centroid_buf = node_means[:, :D].to(dtype)
+        node_source_data: TensorDict | None = None
+        if source_data is not None:
+            node_source_data = layout.unpack(
+                node_means[:, D:].to(data_flat.dtype)
+            ).apply(torch.Tensor.contiguous)
+
+        return SourceAggregates(
+            node_centroid=centroid_buf.contiguous(),
+            node_source_data=node_source_data,
+        )
+
+    def find_dual_interaction_pairs(
+        self,
+        target_tree: "ClusterTree",
+        theta: float = 1.0,
+        *,
+        expand_far_targets: bool = False,
+        validate: bool = True,
+        source_admissible: torch.Tensor | None = None,
+    ) -> DualInteractionPlan:
+        r"""Find near-field and far-field pairs via dual-tree traversal.
+
+        Traverses both the source tree (``self``) and ``target_tree``
+        simultaneously.  For well-separated node pairs, records a single
+        far-field (target_node, source_node) entry - the kernel is evaluated
+        ONCE at the node centroids and broadcast to all targets in the node.
+        This reduces far-field kernel evaluations from O(N log N) to O(N)
+        (unless ``expand_far_targets`` asks for one evaluation per target).
+        The streams are returned in traversal order.
+
+        Uses a combined AABB-distance opening criterion:
+        ``(D_T + D_S) / r < theta``, where D_T and D_S are the AABB
+        diagonals and r is the minimum distance between the two AABBs.
+        This accounts for approximation error on both the target and
+        source sides.
+
+        The traversal starts from every (target root, source root) pair, so
+        either tree may be a forest from :meth:`merge`: the plan is then the
+        per-tree plans joined, indexing the concatenated points.
+
+        Parameters
+        ----------
+        target_tree : ClusterTree
+            Tree or forest over target points.  For self-interaction
+            (communication layers), this is the same object as ``self``.
+        theta : float
+            Barnes-Hut opening angle.  Larger = more aggressive.
+            ``theta = 0`` forces all interactions to be exact.
+        expand_far_targets : bool, optional, default=False
+            If ``True``, no target is approximated by a target-node centroid:
+            far-field node pairs are expanded to individual target points
+            (``(far, far)`` entries become ``(near, far)`` entries), and the
+            leaf-level ``(far, near)`` stream is not used (its sources pair
+            exactly with every target). This removes the target-side error
+            (and the blocky spatial artifacts it produces) at the cost of
+            one kernel evaluation per target instead of one per target
+            node, while keeping the source-side monopole speedup.
+        validate : bool, optional, default=True
+            Run :meth:`DualInteractionPlan.validate` (synchronizes).
+        source_admissible : torch.Tensor or None, optional
+            Boolean mask of shape ``(n_source_nodes,)``. A source node whose
+            entry is ``False`` is never replaced by its aggregate: pairs that
+            pass the geometric test are split on the source side instead, so
+            the node's sources reach the kernel individually or through
+            admissible descendants. The geometric test bounds only the
+            position error of a monopole; use the mask when the kernel also
+            depends on per-source features that vary within some nodes. For
+            unit normals that spread by an RMS angle ``s`` inside a node, the
+            norm of their node average (:meth:`compute_source_aggregates`)
+            is about ``1 - s**2 / 2``, so ``norm >= 1 - tol**2 / 2`` admits
+            nodes whose normals spread by at most about ``tol`` radians.
+
+        Returns
+        -------
+        DualInteractionPlan
+            Near-field individual pairs and far-field node-to-node pairs.
+        """
+        source_tree = self
+        device = source_tree.node_aabb_min.device
+        theta_sq = theta * theta
+
+        ### Handle empty trees
+        if source_tree.n_nodes == 0 or target_tree.n_nodes == 0:
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return DualInteractionPlan(
+                near_target_ids=empty,
+                near_source_ids=empty.clone(),
+                far_target_node_ids=empty.clone(),
+                far_source_node_ids=empty.clone(),
+                nf_target_ids=empty.clone(),
+                nf_source_node_ids=empty.clone(),
+                fn_target_node_ids=empty.clone(),
+                fn_source_ids=empty.clone(),
+                fn_broadcast_targets=empty.clone(),
+                fn_broadcast_starts=empty.clone(),
+                fn_broadcast_counts=empty.clone(),
+                far_broadcast_target_ids=empty.clone(),
+                far_broadcast_pair_ids=empty.clone(),
+                fn_expanded_target_ids=empty.clone(),
+                fn_expanded_pair_ids=empty.clone(),
+            )
+
+        if theta == 0:
+            ### No pair is ever admitted to the far field (``0 > d^2``), so the
+            ### plan is every (target, source) pair; build it directly instead
+            ### of walking both trees down to every leaf pair.
+            n_t, n_s = target_tree.n_sources, source_tree.n_sources
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            plan = DualInteractionPlan(
+                near_target_ids=torch.arange(n_t, device=device).repeat_interleave(
+                    n_s, output_size=n_t * n_s
+                ),
+                near_source_ids=torch.arange(n_s, device=device).repeat(n_t),
+                far_target_node_ids=empty,
+                far_source_node_ids=empty.clone(),
+                nf_target_ids=empty.clone(),
+                nf_source_node_ids=empty.clone(),
+                fn_target_node_ids=empty.clone(),
+                fn_source_ids=empty.clone(),
+                fn_broadcast_targets=empty.clone(),
+                fn_broadcast_starts=empty.clone(),
+                fn_broadcast_counts=empty.clone(),
+                far_broadcast_target_ids=empty.clone(),
+                far_broadcast_pair_ids=empty.clone(),
+                fn_expanded_target_ids=empty.clone(),
+                fn_expanded_pair_ids=empty.clone(),
+            )
+            if validate and not torch.compiler.is_compiling():
+                plan.validate()
+            return plan
+
+        with record_function("cluster_tree::dual_traversal"):
+            ### Initialize: every (target root, source root) pair, target-major;
+            ### the one pair (0, 0) for two single trees.
+            n_tgt_roots = target_tree.root_ids.shape[0]
+            n_src_roots = source_tree.root_ids.shape[0]
+            active_tgt_nodes = target_tree.root_ids.repeat_interleave(
+                n_src_roots, output_size=n_tgt_roots * n_src_roots
+            )
+            active_src_nodes = source_tree.root_ids.repeat(n_tgt_roots)
+
+            ### Output streams.  All per-iteration outputs use a
+            ### deferred-compaction protocol: the per-element tensor is
+            ### accumulated unfiltered together with a boolean validity
+            ### mask, and ONE compaction is paid per stream at the end of
+            ### the traversal.  This trades five per-iteration ``nonzero``
+            ### syncs inside the (near,far)/(far,near)/broadcast paths plus
+            ### two per-iteration syncs in the far path for a fixed handful
+            ### of end-of-loop syncs.
+            far_tgt_unfiltered_list: list[torch.Tensor] = []
+            far_src_unfiltered_list: list[torch.Tensor] = []
+            far_validity_list: list[torch.Tensor] = []
+
+            ### (near,near) output from leaf-leaf expansion is already
+            ### compacted by the ``_ragged_arange`` inside the expansion
+            ### (its output size is set by the Cartesian total anyway),
+            ### so no per-stream validity mask is needed here.
+            near_target_list: list[torch.Tensor] = []
+            near_source_list: list[torch.Tensor] = []
+
+            ### (near,far) stream has two append paths:
+            ###  - ``expand_far_targets=True``: already-filtered entries
+            ###    from the ``_ragged_arange``-with-masked-counts branch
+            ###    below.  No validity mask needed.
+            ###  - ``_expand_dual_leaf_hits``: unfiltered targets +
+            ###    ``nf_validity`` mask (length ``t_full`` per iter).
+            ### Kept in separate lists so the deferred path's compaction
+            ### at end-of-traversal does not touch the already-filtered
+            ### entries.
+            nf_filtered_target_list: list[torch.Tensor] = []
+            nf_filtered_source_node_list: list[torch.Tensor] = []
+            nf_deferred_target_list: list[torch.Tensor] = []
+            nf_deferred_source_node_list: list[torch.Tensor] = []
+            nf_deferred_validity_list: list[torch.Tensor] = []
+
+            ### (far,near) + broadcast mapping from ``_expand_dual_leaf_hits``.
+            ### Both the per-source tensors and the per-source broadcast
+            ### starts/counts are stored unfiltered against the same
+            ### ``fn_validity`` (``= source_is_far``); the broadcast
+            ### targets buffer carries its own ``fn_bcast_validity`` mask
+            ### that drops the sentinel-padded tail of each iter.
+            fn_deferred_tgt_node_list: list[torch.Tensor] = []
+            fn_deferred_src_list: list[torch.Tensor] = []
+            fn_deferred_validity_list: list[torch.Tensor] = []
+            fn_bcast_starts_list: list[torch.Tensor] = []
+            fn_bcast_counts_list: list[torch.Tensor] = []
+            fn_bcast_targets_list: list[torch.Tensor] = []
+            fn_bcast_validity_list: list[torch.Tensor] = []
+            # (leaf, leaf, near) pairs are terminal: recorded per level,
+            # expanded once after the loop.
+            nll_tgt_list: list[torch.Tensor] = []
+            nll_src_list: list[torch.Tensor] = []
+            nll_validity_list: list[torch.Tensor] = []
+
+            ### Loop bound: every iteration descends at least one tree level
+            ### on at least one side, so ``2 * total_levels + safety`` is a
+            ### hard upper bound that requires no GPU->CPU read.  Using
+            ### ``int(max_depth.item())`` as before would force two syncs
+            ### per call before we even start the loop.
+            n_src_levels = max(1, int(source_tree.n_sources).bit_length())
+            n_tgt_levels = max(1, int(target_tree.n_sources).bit_length())
+            # Morton-split trees are deeper than midpoint ones: at most
+            # log(n) / log(4/3) levels with the default balance, and up to the
+            # code width (64) more without it. The loop exits as soon as the
+            # active set is empty, so a generous bound costs nothing.
+            max_iters = 2 * (n_src_levels + n_tgt_levels) + 4 + 2 * 64
+            depth = 0
+
+            ### Per-node tables gathered once per iteration and side (instead
+            ### of one gather per field): ``[aabb_min, aabb_max, diameter,
+            ### diameter_sq]`` and ``[left, right]``.  Every internal node of
+            ### the LBVH has two children and every leaf has none, so
+            ### ``left < 0`` identifies leaves and no child-validity checks
+            ### are needed below.
+            n_dims = source_tree.n_spatial_dims
+            box_S, kids_S = _traversal_tables(source_tree)
+            box_T, kids_T = (
+                (box_S, kids_S)
+                if target_tree is source_tree
+                else _traversal_tables(target_tree)
+            )
+
+            for depth in range(max_iters):
+                ### ``numel()`` is a shape query (Python int), not a sync.
+                if active_tgt_nodes.numel() == 0:
+                    break
+
+                bT = box_T.index_select(1, active_tgt_nodes)
+                bS = box_S.index_select(1, active_src_nodes)
+                kT = kids_T.index_select(1, active_tgt_nodes)
+                kS = kids_S.index_select(1, active_src_nodes)
+
+                ### Combined opening criterion: minimum AABB-to-AABB gap.
+                # For each dimension, the gap is the positive distance
+                # between the two boxes (zero if they overlap).
+                gap = torch.clamp(
+                    torch.maximum(
+                        bT[:n_dims] - bS[n_dims : 2 * n_dims],
+                        bS[:n_dims] - bT[n_dims : 2 * n_dims],
+                    ),
+                    min=0,
+                )
+                min_dist_sq = gap.pow(2).sum(dim=0)
+
+                diam_sq_T = bT[2 * n_dims + 1]
+                diam_sq_S = bS[2 * n_dims + 1]
+                combined_diam_sq = (bT[2 * n_dims] + bS[2 * n_dims]).pow(2)
+                is_far = min_dist_sq * theta_sq > combined_diam_sq
+                if source_admissible is not None:
+                    ### A geometrically far but inadmissible source node is
+                    ### opened on the source side.
+                    admissible_S = source_admissible[active_src_nodes]
+                    force_split_S = is_far & ~admissible_S
+                    is_far = is_far & admissible_S
+
+                ### Classify active pairs (boolean masks over the full
+                ### active set; combined later via ``need_split``).
+                left_T, right_T = kT[0], kT[1]
+                left_S, right_S = kS[0], kS[1]
+                is_leaf_T = left_T < 0
+                is_leaf_S = left_S < 0
+                near_leaf_leaf = (~is_far) & is_leaf_T & is_leaf_S
+                need_split = (~is_far) & (~near_leaf_leaf)
+
+                ### 1. Far-field: deferred-compaction path (expanded to
+                ### targets after the loop when ``expand_far_targets``).
+                far_tgt_unfiltered_list.append(active_tgt_nodes)
+                far_src_unfiltered_list.append(active_src_nodes)
+                far_validity_list.append(is_far)
+
+                ### 2. Near-field, both leaves: recorded for one expansion
+                ### after the loop.
+                nll_tgt_list.append(active_tgt_nodes)
+                nll_src_list.append(active_src_nodes)
+                nll_validity_list.append(near_leaf_leaf)
+
+                ### 3. Generate next iteration's active set.
+                # We compute children over the FULL active set (n_active
+                # entries) and use validity masks per (T,S) child slot to
+                # encode the case-A / case-B / case-C splitting rules from
+                # the original implementation.  After unioning the eight
+                # potential child slots we pay ONE boolean compaction
+                # instead of the original ~12 ``.any()``-gated indexings.
+                # ``~(a > b)`` equals ``a <= b`` except that it is True for a
+                # NaN diameter: a pair with a non-finite box is then split
+                # down to its leaves and lands in the exact near-field
+                # stream (so NaN inputs propagate to the output) instead of
+                # matching no case and silently dropping out of the plan.
+                do_split_T = (~is_leaf_T) & (is_leaf_S | ~(diam_sq_S > diam_sq_T))
+                do_split_S = (~is_leaf_S) & (is_leaf_T | ~(diam_sq_T > diam_sq_S))
+                if source_admissible is not None:
+                    forced = force_split_S & ~is_leaf_S
+                    do_split_S = do_split_S | forced
+                    do_split_T = do_split_T & ~forced
+                case_T_only = need_split & do_split_T & (~do_split_S)
+                case_S_only = need_split & do_split_S & (~do_split_T)
+                case_both = need_split & do_split_T & do_split_S
+
+                ### Eight child-pair slots: each is (t_ids, s_ids, validity)
+                ### where every tensor has shape ``(n_active,)``.
+                # 1: case_T_only, (left_T,  parent_S)
+                # 2: case_T_only, (right_T, parent_S)
+                # 3: case_S_only, (parent_T, left_S)
+                # 4: case_S_only, (parent_T, right_S)
+                # 5: case_both,   (left_T,  left_S)
+                # 6: case_both,   (left_T,  right_S)
+                # 7: case_both,   (right_T, left_S)
+                # 8: case_both,   (right_T, right_S)
+                slot_t = torch.stack(
+                    [
+                        left_T,
+                        right_T,
+                        active_tgt_nodes,
+                        active_tgt_nodes,
+                        left_T,
+                        left_T,
+                        right_T,
+                        right_T,
+                    ]
+                )
+                slot_s = torch.stack(
+                    [
+                        active_src_nodes,
+                        active_src_nodes,
+                        left_S,
+                        right_S,
+                        left_S,
+                        right_S,
+                        left_S,
+                        right_S,
+                    ]
+                )
+                slot_v = torch.stack(
+                    [
+                        case_T_only,
+                        case_T_only,
+                        case_S_only,
+                        case_S_only,
+                        case_both,
+                        case_both,
+                        case_both,
+                        case_both,
+                    ]
+                )
+
+                ### One sync per iteration: the boolean compaction below.
+                ### Each ``tensor[bool_mask]`` lowers to ``aten::nonzero``;
+                ### computing ``keep_idx`` explicitly once and integer-
+                ### indexing both ``slot_t`` and ``slot_s`` collapses the
+                ### two nonzero syncs into one.
+                flat_v = slot_v.reshape(-1)
+                keep_idx = flat_v.nonzero(as_tuple=True)[0]
+                active_tgt_nodes = slot_t.reshape(-1)[keep_idx]
+                active_src_nodes = slot_s.reshape(-1)[keep_idx]
+
+            if active_tgt_nodes.numel() != 0:
+                raise RuntimeError(
+                    f"dual traversal did not terminate in {max_iters} iterations "
+                    f"({active_tgt_nodes.numel()} node pairs still open)"
+                )
+
+            ### Concatenate accumulated pairs and pay one boolean
+            ### compaction per output stream, all at end-of-traversal.
+            ### See :func:`_compact_deferred` and
+            ### :func:`_compact_sentinel_padded` for the protocol.
+            empty_long = torch.empty(0, dtype=torch.long, device=device)
+
+            ### Leaf-leaf expansion over all levels' pairs at once.
+            nll_tgt = torch.cat(nll_tgt_list)
+            nll_src = torch.cat(nll_src_list)
+            nll_valid = torch.cat(nll_validity_list)
+            t_counts = torch.where(nll_valid, target_tree.leaf_count[nll_tgt], 0)
+            s_counts = torch.where(nll_valid, source_tree.leaf_count[nll_src], 0)
+            n_nll, t_total, s_total = torch.stack(
+                [nll_valid.sum(), t_counts.sum(), s_counts.sum()]
+            ).tolist()
+            nll_idx = torch.nonzero_static(nll_valid, size=n_nll)[:, 0]
+            hits = _expand_dual_leaf_hits(
+                nll_tgt[nll_idx],
+                nll_src[nll_idx],
+                target_tree,
+                source_tree,
+                theta,
+                t_total=t_total,
+                s_total=s_total,
+                source_admissible=source_admissible,
+                target_approximation=not expand_far_targets,
+            )
+            near_target_list.append(hits.near_tgts)
+            near_source_list.append(hits.near_srcs)
+            nf_deferred_target_list.append(hits.nf_tgts)
+            nf_deferred_source_node_list.append(hits.nf_snids)
+            nf_deferred_validity_list.append(hits.nf_validity)
+            fn_deferred_tgt_node_list.append(hits.fn_tnids)
+            fn_deferred_src_list.append(hits.fn_sids)
+            fn_deferred_validity_list.append(hits.fn_validity)
+            fn_bcast_starts_list.append(hits.fn_bcast_starts)
+            fn_bcast_counts_list.append(hits.fn_bcast_counts)
+            fn_bcast_targets_list.append(hits.fn_bcast_targets)
+            fn_bcast_validity_list.append(hits.fn_bcast_targets_validity)
+
+            ### One readback sizes every compaction and broadcast below.
+            far_valid = torch.cat(far_validity_list)
+            far_counts = torch.where(
+                far_valid,
+                target_tree.node_range_count[torch.cat(far_tgt_unfiltered_list)],
+                0,
+            )
+            n_far, n_nf, n_fn, n_fn_bcast, n_far_bcast, n_fn_expanded = torch.stack(
+                [
+                    far_valid.sum(),
+                    hits.nf_validity.sum(),
+                    hits.fn_validity.sum(),
+                    hits.fn_bcast_targets_validity.sum(),
+                    far_counts.sum(),
+                    (hits.fn_bcast_counts * hits.fn_validity).sum(),
+                ]
+            ).tolist()
+
+            near_tgt = (
+                torch.cat(near_target_list) if near_target_list else empty_long.clone()
+            )
+            near_src = (
+                torch.cat(near_source_list) if near_source_list else empty_long.clone()
+            )
+
+            ### Far-field stream: deferred (unfiltered + validity).
+            far_tgt_nid, far_src_nid = _compact_deferred(
+                far_tgt_unfiltered_list,
+                far_src_unfiltered_list,
+                validity_list=far_validity_list,
+                device=device,
+                size=n_far,
+            )
+            if expand_far_targets:
+                ### Far node pairs become (near, far) entries per target.
+                positions, pair_ids = _ragged_arange(
+                    target_tree.node_range_start[far_tgt_nid],
+                    target_tree.node_range_count[far_tgt_nid],
+                    total=n_far_bcast,
+                )
+                nf_filtered_target_list.append(
+                    target_tree.sorted_source_order[positions]
+                )
+                nf_filtered_source_node_list.append(far_src_nid[pair_ids])
+                far_tgt_nid, far_src_nid = empty_long.clone(), empty_long.clone()
+                n_far_bcast = 0
+
+            ### (near, far) stream: combine deferred entries from
+            ### ``_expand_dual_leaf_hits`` with the already-filtered
+            ### entries from the ``expand_far_targets=True`` branch.
+            nf_def_tgt, nf_def_snid = _compact_deferred(
+                nf_deferred_target_list,
+                nf_deferred_source_node_list,
+                validity_list=nf_deferred_validity_list,
+                device=device,
+                size=n_nf,
+            )
+            nf_tgt = (
+                torch.cat([nf_def_tgt, *nf_filtered_target_list])
+                if nf_filtered_target_list
+                else nf_def_tgt
+            )
+            nf_snid = (
+                torch.cat([nf_def_snid, *nf_filtered_source_node_list])
+                if nf_filtered_source_node_list
+                else nf_def_snid
+            )
+
+            ### (far, near) + broadcast streams.  The fn tensors and
+            ### the per-source ``fn_bcast_starts/counts`` are aligned
+            ### with ``fn_validity`` (= ``source_is_far``) and compact
+            ### together.  ``fn_broadcast_targets`` is sentinel-padded
+            ### on the *t_full* axis and compacts separately via its
+            ### own validity mask, with ``fn_bcast_starts`` remapped
+            ### into the compacted space.
+            if fn_deferred_validity_list:
+                fn_tnid, fn_sid, fn_bstarts_padded, fn_bcounts = _compact_deferred(
+                    fn_deferred_tgt_node_list,
+                    fn_deferred_src_list,
+                    fn_bcast_starts_list,
+                    fn_bcast_counts_list,
+                    validity_list=fn_deferred_validity_list,
+                    device=device,
+                    size=n_fn,
+                )
+                fn_btgts, fn_bstarts = _compact_sentinel_padded(
+                    torch.cat(fn_bcast_targets_list),
+                    fn_bstarts_padded,
+                    torch.cat(fn_bcast_validity_list),
+                    size=n_fn_bcast,
+                )
+            else:
+                fn_tnid = empty_long.clone()
+                fn_sid = empty_long.clone()
+                fn_btgts = empty_long.clone()
+                fn_bstarts = empty_long.clone()
+                fn_bcounts = empty_long.clone()
+
+            ### Streams stay in traversal order. Grouping them by source made
+            ### GLOBE's BarnesHutKernel 5-25% slower on a GB300, cost ~40% of the
+            ### plan's peak memory, and ``torch.sort`` rejects streams longer than
+            ### ``INT_MAX`` (the communication plan at 800k faces and theta=1).
+
+            ### Expand both broadcasts now (sizes are host-known).
+            positions, far_bcast_pairs = _ragged_arange(
+                target_tree.node_range_start[far_tgt_nid],
+                target_tree.node_range_count[far_tgt_nid],
+                total=n_far_bcast,
+            )
+            far_bcast_tgts = target_tree.sorted_source_order[positions]
+            positions, fn_exp_pairs = _ragged_arange(
+                fn_bstarts, fn_bcounts, total=n_fn_expanded
+            )
+            fn_exp_tgts = fn_btgts[positions]
+
+        plan = DualInteractionPlan(
+            near_target_ids=near_tgt,
+            near_source_ids=near_src,
+            far_target_node_ids=far_tgt_nid,
+            far_source_node_ids=far_src_nid,
+            nf_target_ids=nf_tgt,
+            nf_source_node_ids=nf_snid,
+            fn_target_node_ids=fn_tnid,
+            fn_source_ids=fn_sid,
+            fn_broadcast_targets=fn_btgts,
+            fn_broadcast_starts=fn_bstarts,
+            fn_broadcast_counts=fn_bcounts,
+            far_broadcast_target_ids=far_bcast_tgts,
+            far_broadcast_pair_ids=far_bcast_pairs,
+            fn_expanded_target_ids=fn_exp_tgts,
+            fn_expanded_pair_ids=fn_exp_pairs,
+        )
+
+        if validate and not torch.compiler.is_compiling():
+            plan.validate()
+
+        is_self = target_tree is self
+        logger.debug(
+            "dual traversal: %d near + %d nf + %d fn + %d far_node pairs, "
+            "theta=%.2f, self_interaction=%s, %d iterations",
+            plan.n_near,
+            plan.n_nf,
+            plan.n_fn,
+            plan.n_far_nodes,
+            theta,
+            is_self,
+            depth,
+        )
+
+        return plan
+
+    def find_point_interaction_pairs(
+        self,
+        targets: Float[torch.Tensor, "n_targets n_dims"],
+        theta: float = 1.0,
+        *,
+        validate: bool = True,
+        source_admissible: torch.Tensor | None = None,
+    ) -> PointInteractionPlan:
+        r"""Find near-field pairs and far-field (point, node) pairs for individual
+        target points by a single-tree walk.
+
+        Every target point walks the source tree (``self``) from its root, or
+        from every root in order when ``self`` is a forest from :meth:`merge`.
+        A node is admitted to the far field when ``D_S / r < theta``, with
+        ``D_S`` its AABB diagonal and ``r`` the minimum distance from the point
+        to its AABB: the source-side half of the dual criterion, since a point
+        has no extent. A leaf that is not admitted contributes its sources
+        individually; any other node hands the point to both children. The
+        plan of one target therefore depends on the tree and that target alone.
+
+        Use this for scattered targets, such as volume prediction points,
+        instead of :meth:`find_dual_interaction_pairs` with
+        ``expand_far_targets=True``. The dual criterion charges the target
+        node's own diameter ``D_T``, so a leaf of far-apart points in a sparse
+        region is never well separated from the sources near it and reads them
+        one by one, although each of its points alone would be. On a 200k-face
+        car with 200k volume points the dual plan held 1.6e9 pairs at
+        ``theta=0.5`` and the point plan holds 1.5e8.
+
+        Parameters
+        ----------
+        targets : Float[torch.Tensor, "n_targets n_dims"]
+            Target point coordinates, shape :math:`(M, D)`.
+        theta : float
+            Barnes-Hut opening angle. ``theta = 0`` forces all interactions to
+            be exact (the plan is every pair, built directly).
+        validate : bool, optional, default=True
+            Run :meth:`PointInteractionPlan.validate` (synchronizes).
+        source_admissible : torch.Tensor or None, optional
+            Boolean mask of shape ``(n_source_nodes,)``, as in
+            :meth:`find_dual_interaction_pairs`: a source node whose entry is
+            ``False`` is never replaced by its aggregate; the point descends
+            into it instead.
+
+        Returns
+        -------
+        PointInteractionPlan
+            Near-field individual pairs and far-field (point, node) pairs, in
+            traversal order.
+        """
+        device = self.node_aabb_min.device
+        n_targets = targets.shape[0]
+        theta_sq = theta * theta
+        empty = torch.empty(0, dtype=torch.long, device=device)
+
+        if self.n_nodes == 0 or n_targets == 0:
+            return PointInteractionPlan(
+                near_target_ids=empty,
+                near_source_ids=empty.clone(),
+                far_target_ids=empty.clone(),
+                far_source_node_ids=empty.clone(),
+            )
+
+        if theta == 0:
+            n_s = self.n_sources
+            plan = PointInteractionPlan(
+                near_target_ids=torch.arange(
+                    n_targets, device=device
+                ).repeat_interleave(n_s, output_size=n_targets * n_s),
+                near_source_ids=torch.arange(n_s, device=device).repeat(n_targets),
+                far_target_ids=empty,
+                far_source_node_ids=empty.clone(),
+            )
+            if validate and not torch.compiler.is_compiling():
+                plan.validate()
+            return plan
+
+        with record_function("cluster_tree::point_traversal"):
+            n_dims = self.n_spatial_dims
+            box, kids = _traversal_tables(self)
+            points = targets.detach().to(box.dtype).t().contiguous()  # (D, M)
+
+            ### Every target starts at every root, target-major. Outputs follow
+            ### the dual traversal's deferred-compaction protocol:
+            ### per-iteration tensors with validity masks, one compaction per
+            ### stream after the loop, one readback for the sizes.
+            n_roots = self.root_ids.shape[0]
+            active_t = torch.arange(n_targets, device=device).repeat_interleave(
+                n_roots, output_size=n_targets * n_roots
+            )
+            active_s = self.root_ids.repeat(n_targets)
+            far_t_list: list[torch.Tensor] = []
+            far_s_list: list[torch.Tensor] = []
+            far_validity_list: list[torch.Tensor] = []
+            leaf_t_list: list[torch.Tensor] = []
+            leaf_s_list: list[torch.Tensor] = []
+            leaf_validity_list: list[torch.Tensor] = []
+
+            n_levels = max(1, int(self.n_sources).bit_length())
+            max_iters = n_levels + 4 + 64
+            depth = 0
+            for depth in range(max_iters):
+                if active_t.numel() == 0:
+                    break
+                bS = box.index_select(1, active_s)
+                kS = kids.index_select(1, active_s)
+                p = points.index_select(1, active_t)
+                gap = torch.clamp(
+                    torch.maximum(p - bS[n_dims : 2 * n_dims], bS[:n_dims] - p), min=0
+                )
+                min_dist_sq = gap.pow(2).sum(dim=0)
+                ### ``>`` is False for a NaN box or point, so such a pair is
+                ### opened down to the leaves and lands in the exact stream.
+                is_far = min_dist_sq * theta_sq > bS[2 * n_dims + 1]
+                if source_admissible is not None:
+                    is_far = is_far & source_admissible[active_s]
+                is_leaf = kS[0] < 0
+                leaf_hit = (~is_far) & is_leaf
+                need_split = (~is_far) & (~is_leaf)
+
+                far_t_list.append(active_t)
+                far_s_list.append(active_s)
+                far_validity_list.append(is_far)
+                leaf_t_list.append(active_t)
+                leaf_s_list.append(active_s)
+                leaf_validity_list.append(leaf_hit)
+
+                ### Next level: both children of every opened internal node.
+                ### One boolean compaction (sync) per iteration.
+                keep_idx = torch.cat([need_split, need_split]).nonzero(as_tuple=True)[0]
+                active_t = torch.cat([active_t, active_t])[keep_idx]
+                active_s = torch.cat([kS[0], kS[1]])[keep_idx]
+
+            if active_t.numel() != 0:
+                raise RuntimeError(
+                    f"point traversal did not terminate in {max_iters} iterations "
+                    f"({active_t.numel()} (target, node) pairs still open)"
+                )
+
+            leaf_valid = torch.cat(leaf_validity_list)
+            leaf_counts = torch.where(
+                leaf_valid, self.leaf_count[torch.cat(leaf_s_list)], 0
+            )
+            n_far, n_leaf, n_near = torch.stack(
+                [
+                    torch.cat(far_validity_list).sum(),
+                    leaf_valid.sum(),
+                    leaf_counts.sum(),
+                ]
+            ).tolist()
+            far_t, far_s = _compact_deferred(
+                far_t_list,
+                far_s_list,
+                validity_list=far_validity_list,
+                device=device,
+                size=n_far,
+            )
+            leaf_t, leaf_s = _compact_deferred(
+                leaf_t_list,
+                leaf_s_list,
+                validity_list=leaf_validity_list,
+                device=device,
+                size=n_leaf,
+            )
+            positions, hit_ids = _ragged_arange(
+                self.leaf_start[leaf_s], self.leaf_count[leaf_s], total=n_near
+            )
+            near_t = leaf_t[hit_ids]
+            near_s = self.sorted_source_order[positions]
+
+        plan = PointInteractionPlan(
+            near_target_ids=near_t,
+            near_source_ids=near_s,
+            far_target_ids=far_t,
+            far_source_node_ids=far_s,
+        )
+        if validate and not torch.compiler.is_compiling():
+            plan.validate()
+        logger.debug(
+            "point traversal: %d near + %d far pairs for %d targets, theta=%.2f, %d iterations",
+            plan.n_near,
+            plan.n_far,
+            n_targets,
+            theta,
+            depth,
+        )
+        return plan
+
+
+# ---------------------------------------------------------------------------
+# SourceAggregates: per-node aggregate data for far-field approximation
+# ---------------------------------------------------------------------------
+
+
+class SourceAggregates(TensorClass):
+    """Per-node aggregated source data for far-field monopole approximation.
+
+    Computed by :meth:`ClusterTree.compute_source_aggregates` and consumed
+    by :class:`BarnesHutKernel` during kernel evaluation.
+    """
+
+    node_centroid: Float[torch.Tensor, "n_nodes n_dims"]
+    """Area-weighted centroid per node."""
+
+    node_source_data: TensorDict | None
+    """Area-weighted average source features per node, or ``None`` if no
+    per-source features. Has ``batch_size=(n_nodes,)``."""
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers for tree construction
+# ---------------------------------------------------------------------------
+
+
+def _node_boxes(
+    topo: LBVHTopology,
+    sorted_points: Float[torch.Tensor, "n_sorted n_dims"],
+    leaf_size: int,
+) -> tuple[
+    Float[torch.Tensor, "n_nodes n_dims"], Float[torch.Tensor, "n_nodes n_dims"]
+]:
+    """Per-node AABBs: leaves from their points, internal nodes bottom-up.
+
+    Bounds are kept packed as ``[min, -max]`` so that one ``torch.minimum``
+    merges both. Both topology builders give each node's two children the
+    consecutive ids ``left`` and ``left + 1``, so one gather from an
+    overlapping ``(left, left + 1)`` row-pair view fetches both children.
+    """
+    n_items, D = sorted_points.shape
+    packed = torch.cat([sorted_points, -sorted_points], dim=1)  # (n_items, 2D)
+    box = torch.empty(
+        (topo.max_nodes, 2 * D), dtype=sorted_points.dtype, device=sorted_points.device
+    )
+    if leaf_size == 1:
+        box[topo.leaf_node_ids] = packed[topo.leaf_starts]
+    else:
+        positions, seg_ids = _ragged_arange(
+            topo.leaf_starts, topo.leaf_sizes, total=n_items
+        )
+        leaf_box = torch.full(
+            (topo.leaf_node_ids.shape[0], 2 * D),
+            float("inf"),
+            dtype=sorted_points.dtype,
+            device=sorted_points.device,
+        )
+        leaf_box.scatter_reduce_(
+            0,
+            seg_ids.unsqueeze(1).expand(-1, 2 * D),
+            packed[positions],
+            reduce="amin",
+            include_self=True,
+        )
+        box[topo.leaf_node_ids] = leaf_box
+    if topo.max_nodes > 1:
+        child_pairs = box.as_strided((topo.max_nodes - 1, 2, 2 * D), (2 * D, 2 * D, 1))
+        for nodes in reversed(topo.internal_nodes_per_level):
+            pairs = child_pairs[topo.left_child[nodes]]  # (n_level, 2, 2D)
+            box[nodes] = pairs.amin(dim=1)
+    box = box[: topo.node_count]
+    return box[:, :D].contiguous(), (-box[:, D:]).contiguous()

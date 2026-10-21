@@ -37,10 +37,11 @@ from __future__ import annotations
 
 import torch
 
+from physicsnemo.datapipes.keys import as_nested_key
 from physicsnemo.datapipes.registry import register
 from physicsnemo.datapipes.transforms.mesh.base import MeshTransform
 from physicsnemo.mesh import DomainMesh, Mesh
-from physicsnemo.nn.functional import signed_distance_field
+from physicsnemo.mesh.spatial.sdf import signed_distance_field
 
 
 @register()
@@ -49,14 +50,17 @@ class ComputeSDFFromBoundary(MeshTransform):
 
     Reads the surface mesh from ``domain.boundaries[boundary_name]`` and
     evaluates the signed distance field at every interior point using
-    :func:`physicsnemo.nn.functional.signed_distance_field` (Warp-backed,
-    GPU-accelerated).
+    :func:`physicsnemo.mesh.spatial.sdf.signed_distance_field`,
+    a mesh-native wrapper around Warp mesh queries.
 
     The computed SDF is stored as a scalar field ``(N, 1)`` in
     ``interior.point_data[sdf_field]``.  If ``normals_field`` is set,
     approximate surface normals ``(N, 3)`` are also stored, computed as
-    the normalized direction from each query point to its closest point
-    on the surface (with center-of-mass fallback for on-surface points).
+    the normalized direction from the closest surface point to each query
+    point.  Points essentially *on* the surface (boundary-layer points at
+    sub-micron wall distances) instead use the hit-face normal, since at
+    those distances that direction is float32 rounding noise.  The normal
+    points outward unless the query is inside by more than roundoff.
 
     Parameters
     ----------
@@ -81,8 +85,11 @@ class ComputeSDFFromBoundary(MeshTransform):
     ) -> None:
         super().__init__()
         self.boundary_name = boundary_name
-        self.sdf_field = sdf_field
-        self.normals_field = normals_field
+        ### Field names may spell nested leaves ("geom.sdf").
+        self.sdf_field = as_nested_key(sdf_field)
+        self.normals_field = (
+            as_nested_key(normals_field) if normals_field is not None else None
+        )
         self.use_winding_number = use_winding_number
 
     def __call__(self, mesh: Mesh) -> Mesh:
@@ -112,10 +119,8 @@ class ComputeSDFFromBoundary(MeshTransform):
             )
 
         surface = domain.boundaries[self.boundary_name]
-        vertices = surface.points.float()
-        faces = surface.cells
 
-        if faces is None or faces.numel() == 0:
+        if surface.n_cells == 0:
             raise ValueError(
                 f"Boundary {self.boundary_name!r} has no cell connectivity "
                 f"(required for SDF computation)"
@@ -123,9 +128,8 @@ class ComputeSDFFromBoundary(MeshTransform):
 
         query_points = domain.interior.points.float()
 
-        sdf_values, closest_points = signed_distance_field(
-            vertices,
-            faces,
+        sdf_values, closest_points, hit_faces = signed_distance_field(
+            surface,
             query_points,
             use_sign_winding_number=self.use_winding_number,
         )
@@ -138,26 +142,39 @@ class ComputeSDFFromBoundary(MeshTransform):
         if self.normals_field is not None:
             normals = query_points - closest_points
 
-            # Fallback for points on the surface (zero distance):
-            # use direction from center of mass instead.
+            # Near the wall, (query - closest) is float32 roundoff, so use the
+            # hit-face normal, the exact limit of its direction at the wall.
+            # Roundoff scales with eps * |coordinate|; 128 eps leaves a wide
+            # margin. Mask rather than branch on ``near_surface.any()``: that
+            # host readback would stall the prefetch stream.
             dist = torch.norm(normals, dim=-1)
-            on_surface = dist < 1e-6
-            if on_surface.any():
-                com = vertices.mean(dim=0, keepdim=True)
-                normals[on_surface] = query_points[on_surface] - com
+            coord_scale = query_points.abs().amax(dim=-1).clamp(min=1.0)
+            surface_tolerance = 128.0 * torch.finfo(torch.float32).eps * coord_scale
+            near_surface = dist < surface_tolerance
+            face_normals = surface.cell_normals.to(query_points.dtype)[hit_faces]
+            # A degenerate (zero-area) hit face has no meaningful normal --
+            # ``cell_normals`` returns a zero vector for it. Keep the raw
+            # closest-point direction there instead of substituting zeros.
+            face_normal_ok = (face_normals * face_normals).sum(-1) > 0.5
+            # Take the side from the offset along the face normal, not the
+            # SDF: |sdf| also carries tangential closest-point roundoff, which
+            # reaches tens of ulps on thin faces. Within a few ulps the side
+            # is unresolved; default to outward, as volume points lie outside.
+            sign_tolerance = 8.0 * torch.finfo(torch.float32).eps * coord_scale
+            genuinely_inside = (normals * face_normals).sum(-1) < -sign_tolerance
+            oriented = torch.where(
+                genuinely_inside.unsqueeze(-1), -face_normals, face_normals
+            )
+            normals = torch.where(
+                (near_surface & face_normal_ok).unsqueeze(-1), oriented, normals
+            )
 
             # Normalize to unit vectors
             norm = torch.norm(normals, dim=-1, keepdim=True).clamp(min=1e-8)
             normals = normals / norm
             new_pd[self.normals_field] = normals
 
-        new_interior = Mesh(
-            points=domain.interior.points,
-            cells=domain.interior.cells,
-            point_data=new_pd,
-            cell_data=domain.interior.cell_data,
-            global_data=domain.interior.global_data,
-        )
+        new_interior = domain.interior.with_data(point_data=new_pd)
 
         return DomainMesh(
             interior=new_interior,

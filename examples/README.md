@@ -48,8 +48,14 @@ The several examples inside PhysicsNeMo can be classified based on their domains
 |[Fluid Super-resolution*](./cfd/flow_reconstruction_diffusion/)|Denoising Diffusion Probablistic Model|YES|
 |[Pre-trained DPOT for Navier-Stokes*](./cfd/navier_stokes_dpot/)|Denoising Operator Transformer|YES|
 |[Fine-tuning of DoMINO NIM](./cfd/external_aerodynamics/domino_nim_finetuning/)|DoMINO|NO|
-|[Transolver for External Aerodynamics on Irregular Meshes](./cfd/external_aerodynamics/transolver/)|Transolver|NO|
+|[Transolver for External Aerodynamics on Irregular Meshes](./cfd/external_aerodynamics/transformer_models/)|Transolver|NO|
+|[Rotor37 Compressor Blade](./cfd/rotor37_geotransolver/)|GeoTransolver|NO|
 
+### TCAD
+
+|Use case|Model|
+| --- | --- |
+|[FP-DDM Thermal and Elasticity Domain Decomposition](./tcad/fp_ddm/)|FNO + Schwarz (thermal); numerical Schwarz (elasticity)|
 
 ### Weather
 
@@ -62,7 +68,7 @@ The several examples inside PhysicsNeMo can be classified based on their domains
 |[Diagonistic (Precipitation) model using AFNO](./weather/diagnostic/)|AFNO|
 |[Unified Recipe for training several Global Weather Forecasting models](./weather/unified_recipe/)|AFNO, FCN-SFNO, GraphCast|
 |[Generative Correction Diffusion Model for Km-scale Atmospheric Downscaling](./weather/corrdiff/)|CorrDiff|
-|[StormCast: Generative Diffusion Model for Km-scale, Convection allowing Model Emulation](./weather/stormcast/)|StormCast|
+|[Regional Weather Diffusion: Generative Diffusion Models for Km-scale Weather](./weather/regional_weather_diffusion/)|StormCast, StormScope|
 |[Medium-range global weather forecast using Mixture of Experts](./weather/mixture_of_experts/)|MoE Model|
 |[Generative Data Assimilation of Sparse Weather Observations](./weather/regen/)|Denoising Diffusion Model|
 |[Flood Forecasting](./weather/flood_modeling/)|GNN + KAN|
@@ -94,6 +100,12 @@ The several examples inside PhysicsNeMo can be classified based on their domains
 | --- | --- |
 |[Force Prediciton for Lennard Jones system](./molecular_dynamics/lennard_jones/)|MeshGraphNet|
 
+### Kinetic Monte Carlo
+
+|Use case|Model|
+| --- | --- |
+|[Probabilistic surrogate for Kinetic Monte Carlo solvers](./kinetic_monte_carlo/)|GeoTransolver|
+
 ### Geophysics
 
 |Use case|Model|
@@ -110,6 +122,7 @@ The several examples inside PhysicsNeMo can be classified based on their domains
 ### Active Learning
 
 1. [Classify the famous two-moons data distribution using Active learning](./active_learning/moons/)
+2. [Active Learning for Surface-CFD Aerodynamic Surrogates](./cfd/external_aerodynamics/active_learning_aero/)
 
 ## Additional examples
 

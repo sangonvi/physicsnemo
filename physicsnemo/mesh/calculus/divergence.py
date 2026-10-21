@@ -32,8 +32,9 @@ over edges:
 
 where :math:`w_{vw} = |{\star}e|/|e|` are the FEM cotangent weights and
 :math:`|{\star}v|` is the dual 0-cell (Voronoi) volume. This is exact for
-linear vector fields at interior vertices and first-order convergent on
-smooth fields.
+linear vector fields at interior vertices of 1D meshes and of uniform grids.
+On irregular triangle or tetrahedral meshes it is not exact for linear fields,
+and its pointwise error need not shrink as the mesh refines.
 
 Physical interpretation: net flux through the dual cell boundary per unit
 volume, with the PDP-flat providing the edge flux estimate.
@@ -120,7 +121,7 @@ def compute_divergence_points_dec(
     # v0 (smaller index): edge points outward from v0's dual cell → positive
     # v1 (larger index):  edge points inward to v1's dual cell   → negative
     divergence = torch.zeros(
-        n_points, dtype=vector_field.dtype, device=mesh.points.device
+        n_points, dtype=weighted_flux.dtype, device=mesh.points.device
     )
     divergence.scatter_add_(0, v0_indices, weighted_flux)
     divergence.scatter_add_(0, v1_indices, -weighted_flux)
@@ -145,11 +146,12 @@ def compute_divergence_points_lsq(
             + \frac{\partial v_y}{\partial y}
             + \frac{\partial v_z}{\partial z}
 
-    Computes the full Jacobian via a single batched LSQ solve, then takes
-    the trace. This is more efficient than solving each component separately,
-    because the adjacency construction, neighbor grouping, A-matrix assembly,
-    and batched lstsq are all performed once instead of ``n_spatial_dims``
-    times.
+    Computes the full derivative-first Jacobian
+    ``jacobian[i, k, j] = ∂v_j/∂x_k`` via a single batched LSQ solve,
+    then takes the trace. This is more efficient than solving each component
+    separately, because the adjacency construction, neighbor grouping,
+    A-matrix assembly, and batched lstsq are all performed once instead of
+    ``n_spatial_dims`` times.
 
     Parameters
     ----------
@@ -165,9 +167,39 @@ def compute_divergence_points_lsq(
     """
     from physicsnemo.mesh.calculus._lsq_reconstruction import compute_point_gradient_lsq
 
-    ### Single call computes full Jacobian: J[i, j, k] = ∂v_j/∂x_k
+    ### Single call computes full Jacobian: J[i, k, j] = ∂v_j/∂x_k
     # Shape: (n_points, n_spatial_dims, n_spatial_dims)
     jacobian = compute_point_gradient_lsq(mesh, vector_field)
 
     ### Divergence = trace of Jacobian = Σ_k ∂v_k/∂x_k
+    return torch.einsum("...ii", jacobian)
+
+
+def compute_divergence_cells_lsq(
+    mesh: "Mesh",
+    vector_field: Float[torch.Tensor, "n_cells n_spatial_dims"],
+) -> Float[torch.Tensor, " n_cells"]:
+    r"""Compute divergence at cell centers using the LSQ Jacobian trace.
+
+    Cell-centered analogue of :func:`compute_divergence_points_lsq`: computes
+    the full derivative-first Jacobian via a single batched cell-neighbour LSQ
+    solve, then takes the trace.
+
+    Parameters
+    ----------
+    mesh : Mesh
+        Simplicial mesh.
+    vector_field : torch.Tensor
+        Vectors at cell centers, shape ``(n_cells, n_spatial_dims)``.
+
+    Returns
+    -------
+    Float[torch.Tensor, " n_cells"]
+        Divergence at cell centers, shape ``(n_cells,)``.
+    """
+    from physicsnemo.mesh.calculus._lsq_reconstruction import compute_cell_gradient_lsq
+
+    # J[i, k, j] = ∂v_j/∂x_k, shape (n_cells, n_spatial_dims, n_spatial_dims)
+    jacobian = compute_cell_gradient_lsq(mesh, vector_field)
+
     return torch.einsum("...ii", jacobian)

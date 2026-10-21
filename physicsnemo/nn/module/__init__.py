@@ -25,6 +25,7 @@ from .activations import (
     Stan,
     get_activation,
 )
+from .attention_layers import UNetAttention3D
 from .ball_query import BQWarp
 from .concrete_dropout import (
     ConcreteDropout,
@@ -39,10 +40,11 @@ from .conditioning_embedders import (
     ZeroConditioningEmbedder,
     get_conditioning_embedder,
 )
-from .conv_layers import ConvBlock, CubeEmbedding
+from .conv_layers import Conv3D, ConvBlock, CubeEmbedding
 from .dgm_layers import DGMLayer
 from .dit_layers import (
     AttentionModuleBase,
+    ConvDetokenizer,
     DetokenizerModuleBase,
     DiTBlock,
     Natten2DSelfAttention,
@@ -50,6 +52,7 @@ from .dit_layers import (
     PerSampleDropout,
     ProjLayer,
     ProjReshape2DDetokenizer,
+    RopeNatten2DSelfAttention,
     TESelfAttention,
     TimmSelfAttention,
     TokenizerModuleBase,
@@ -61,6 +64,7 @@ from .dit_layers import (
 from .drop import DropPath
 from .embedding_layers import (
     FourierEmbedding,
+    FourierPositionalEmbedding,
     OneHotEmbedding,
     PositionalEmbedding,
     SinusoidalTimestepEmbedding,
@@ -80,7 +84,7 @@ from .fully_connected_layers import (
     ConvNdKernel1Layer,
     FCLayer,
 )
-from .group_norm import GroupNorm, get_group_norm
+from .group_norm import GroupNorm, GroupNorm3D, get_group_norm
 from .hpx import (
     HEALPixAvgPool,
     HEALPixFoldFaces,
@@ -92,11 +96,23 @@ from .hpx import (
 )
 from .kan_layers import KolmogorovArnoldNetwork
 from .mlp_layers import Mlp
+from .point_transformer_attention import (
+    AdaLNResidualMLP,
+    LocalPointTransformerBlock,
+    LocalTokenCrossAttentionBlock,
+)
 from .resample_layers import (
     DownSample2D,
     DownSample3D,
     UpSample2D,
     UpSample3D,
+)
+from .rope import (
+    RotaryEmbedding1DTables,
+    RotaryEmbedding2DTables,
+    apply_rotary_pos_emb,
+    build_axial_rope_cos_sin_2d,
+    build_rope_cos_sin_1d,
 )
 from .siren_layers import SirenLayer, SirenLayerType
 from .spectral_layers import (
@@ -111,6 +127,6 @@ from .transformer_layers import (
     FuserLayer,
     SwinTransformer,
 )
-from .unet_layers import UNetBlock
+from .unet_layers import UNetBlock, UNetBlock3D
 from .weight_fact import WeightFactLinear
 from .weight_norm import WeightNormLinear

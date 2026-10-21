@@ -314,6 +314,21 @@ class TestRandomSampling:
         ### Note: alpha != 1.0 is not supported under torch.compile
         # so we don't test it here to avoid the NotImplementedError
 
+    def test_small_alpha_samples_stay_in_cell(self):
+        """Small alpha gives Dirichlet rows whose raw Gamma sums are tiny; the
+        samples must still lie in the cell x >= 1, y >= 1, x + y <= 3."""
+        torch.manual_seed(0)
+        points = torch.tensor([[1.0, 1.0], [2.0, 1.0], [1.0, 2.0]], dtype=torch.float64)
+        mesh = Mesh(points=points, cells=torch.tensor([[0, 1, 2]]))
+
+        sampled = sample_random_points_on_cells(
+            mesh, cell_indices=torch.zeros(20_000, dtype=torch.long), alpha=0.05
+        )
+
+        tol = 1e-12
+        assert (sampled >= 1.0 - tol).all()
+        assert (sampled.sum(dim=-1) <= 3.0 + tol).all()
+
     def test_empty_cell_indices(self):
         """Test sampling with empty cell_indices."""
         torch.manual_seed(42)
@@ -557,3 +572,16 @@ class TestRealisticMeshSampling:
 
         assert sampled.shape == (5, 3)
         assert_on_device(sampled, device)
+
+
+def test_random_sampling_preserves_mesh_dtype():
+    """Regression: barycentric weights (hence sampled points) must be drawn in the
+    mesh dtype; a float64 mesh previously sampled weights in float32, halving precision.
+    """
+    points = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=torch.float64)
+    cells = torch.tensor([[0, 1, 2]], dtype=torch.int64)
+    mesh = Mesh(points=points, cells=cells)
+    samples = sample_random_points_on_cells(
+        mesh, cell_indices=torch.zeros(64, dtype=torch.int64)
+    )
+    assert samples.dtype == torch.float64

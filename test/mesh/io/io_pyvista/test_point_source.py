@@ -16,10 +16,12 @@
 
 """Tests for from_pyvista point_source and warn_on_lost_data parameters."""
 
+import functools
 import warnings
 
 import numpy as np
 import pytest
+import torch
 
 pv = pytest.importorskip("pyvista")
 
@@ -70,6 +72,49 @@ def _make_hex_pair() -> "pv.UnstructuredGrid":
     return mesh
 
 
+def _make_tapered_hex_polyhedron() -> "pv.UnstructuredGrid":
+    """A hexahedron with a smaller top face, stored as one POLYHEDRON cell.
+
+    Its volume centroid (z = 11/28) lies below its vertex mean (z = 1/2).
+    """
+    points = np.array(
+        [
+            [0, 0, 0],
+            [2, 0, 0],
+            [2, 2, 0],
+            [0, 2, 0],
+            [0.5, 0.5, 1],
+            [1.5, 0.5, 1],
+            [1.5, 1.5, 1],
+            [0.5, 1.5, 1],
+        ],
+        dtype=np.float64,
+    )
+    faces = [
+        [0, 3, 2, 1],
+        [4, 5, 6, 7],
+        [0, 1, 5, 4],
+        [1, 2, 6, 5],
+        [2, 3, 7, 6],
+        [3, 0, 4, 7],
+    ]
+    stream = [len(faces)] + [i for face in faces for i in (len(face), *face)]
+    return pv.UnstructuredGrid([len(stream), *stream], [pv.CellType.POLYHEDRON], points)
+
+
+def _make_skewed_cell(name: str, seed: int = 0) -> "pv.UnstructuredGrid":
+    """One cell of the named type, from pyvista.examples.cells, with its points
+    displaced at random."""
+    if name == "Polyhedron":
+        # The example polyhedron is a tetrahedron, whose centers all agree.
+        grid = _make_tapered_hex_polyhedron()
+    else:
+        grid = getattr(pv.examples.cells, name)()
+    rng = np.random.default_rng(seed)
+    grid.points = grid.points + 0.1 * rng.standard_normal(grid.points.shape)
+    return grid
+
+
 # ---------------------------------------------------------------------------
 # point_source="vertices" (default behavior preservation)
 # ---------------------------------------------------------------------------
@@ -113,6 +158,15 @@ class TestVerticesPointCloud:
             mesh.point_data["temperature"].numpy(),
             [100.0, 200.0, 300.0, 400.0],
         )
+
+    def test_integer_coordinates_are_promoted_to_float32(self):
+        points = np.array([[0, 0, 0], [1, 0, 0]], dtype=np.int32)
+        pv_mesh = pv.PointSet(points, force_float=False)
+
+        mesh = from_pyvista(pv_mesh)
+
+        assert mesh.points.numpy().dtype == np.float32
+        np.testing.assert_array_equal(mesh.points.numpy(), points)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +261,32 @@ class TestCellCentroidsPointCloud:
             atol=1e-5,
         )
 
+    def test_centroid_preserves_float64_large_offset(self):
+        """Centroid extraction must not collapse small translated geometry."""
+        points = np.array(
+            [
+                [1e8, 1e8, 0.0],
+                [1e8 + 1.0, 1e8, 0.0],
+                [1e8, 1e8 + 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        pv_mesh = pv.PolyData.from_regular_faces(points, np.array([[0, 1, 2]]))
+
+        mesh = from_pyvista(
+            pv_mesh,
+            point_source="cell_centroids",
+            warn_on_lost_data=False,
+        )
+
+        assert mesh.points.numpy().dtype == np.float64
+        np.testing.assert_allclose(
+            mesh.points.numpy(),
+            [[1e8 + 1.0 / 3.0, 1e8 + 1.0 / 3.0, 0.0]],
+            rtol=0.0,
+            atol=2e-8,
+        )
+
     def test_cell_data_becomes_point_data(self):
         pv_mesh = _make_tet_with_data()
         mesh = from_pyvista(
@@ -262,6 +342,158 @@ class TestCellCentroidsPointCloud:
         assert mesh.n_points == 1
         assert mesh.point_data["vol_id"].item() == 42
 
+    @pytest.mark.parametrize("as_unstructured", [False, True])
+    def test_centroid_of_variable_size_cells_is_vertex_mean(self, as_unstructured):
+        """Polygon, polyline, strip and poly-vertex centroids are vertex means."""
+        angles = np.linspace(0, 2 * np.pi, 6)[:-1]
+        pentagon = np.stack([np.cos(angles), np.sin(angles), np.zeros(5)], axis=1)
+        others = np.array(
+            [[0, 0, 1], [1, 0, 1], [2, 0, 1], [0, 1, 2], [1, 1, 2], [2, 1, 2]],
+            dtype=np.float64,
+        )
+        pv_mesh = pv.PolyData(
+            np.concatenate([pentagon, others]),
+            verts=[4, 5, 6, 7, 10],  # poly-vertex
+            lines=[3, 5, 6, 7],  # straight polyline
+            faces=[5, 0, 1, 2, 3, 4],  # regular pentagon
+            strips=[6, 5, 6, 7, 8, 9, 10],  # triangle strip
+        )
+        if as_unstructured:
+            pv_mesh = pv_mesh.cast_to_unstructured_grid()
+
+        mesh = from_pyvista(
+            pv_mesh,
+            manifold_dim=0,
+            point_source="cell_centroids",
+            warn_on_lost_data=False,
+        )
+
+        # PolyData cell order: verts, lines, polys, strips.
+        expected = [
+            [1.25, 0.25, 1.25],  # mean of (0,0,1), (1,0,1), (2,0,1), (2,1,2)
+            [1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.5, 1.5],
+        ]
+        np.testing.assert_allclose(mesh.points.numpy(), expected, atol=1e-12)
+
+    @pytest.mark.parametrize("as_unstructured", [False, True])
+    @pytest.mark.parametrize(
+        "dtype,x",
+        [
+            (np.int64, 2**62),
+            (np.float32, 2e38),
+            (np.float64, 8e307),
+            (np.float64, np.finfo(np.float64).max),
+        ],
+    )
+    def test_variable_size_centroid_near_dtype_limit(self, as_unstructured, dtype, x):
+        """A polyline centroid is exact even when its vertex sum would overflow."""
+        pv_mesh = pv.PolyData(
+            np.array([[x, 0, 0], [x, 1, 0], [x, 2, 0]], dtype=dtype),
+            lines=[3, 0, 1, 2],
+            force_float=False,
+        )
+        if as_unstructured:
+            pv_mesh = pv_mesh.cast_to_unstructured_grid()
+
+        mesh = from_pyvista(
+            pv_mesh,
+            manifold_dim=0,
+            point_source="cell_centroids",
+            warn_on_lost_data=False,
+        )
+
+        expected = [[float(dtype(x)), 1.0, 0.0]]
+        np.testing.assert_allclose(mesh.points.numpy(), expected, rtol=1e-12)
+
+    @pytest.mark.parametrize(
+        "cell",
+        [
+            "Vertex",
+            "PolyVertex",
+            "Line",
+            "PolyLine",
+            "Triangle",
+            "TriangleStrip",
+            "Polygon",
+            "Pixel",
+            "Quadrilateral",
+            "Tetrahedron",
+            "Voxel",
+            "Hexahedron",
+            "Wedge",
+            "Pyramid",
+            "PentagonalPrism",
+            "HexagonalPrism",
+            "Polyhedron",
+        ],
+    )
+    def test_centroid_of_every_linear_cell_is_vertex_mean(self, cell):
+        """A skewed cell of each linear type is centered on its vertex mean.
+
+        VTK centers most of these elsewhere: at their parametric center, or
+        for polyhedra at their volume centroid.
+        """
+        grid = _make_skewed_cell(cell)
+        mesh = from_pyvista(
+            grid,
+            manifold_dim=0,
+            point_source="cell_centroids",
+            warn_on_lost_data=False,
+        )
+
+        vertex_mean = grid.points[grid.get_cell(0).point_ids].mean(axis=0)
+        np.testing.assert_allclose(mesh.points.numpy(), [vertex_mean], atol=1e-12)
+        assert mesh.points.numpy().dtype == grid.cell_centers().points.dtype
+
+    def test_centroids_of_mixed_cells_averaged_in_chunks(self, monkeypatch):
+        """In a mixed grid averaged two cells at a time, every cell keeps its
+        own vertex mean."""
+        from physicsnemo.mesh.io import io_pyvista
+
+        monkeypatch.setattr(
+            io_pyvista,
+            "_vertex_means",
+            functools.partial(io_pyvista._vertex_means, chunk_size=2),
+        )
+        names = ["Pyramid", "Tetrahedron", "Wedge", "Polyhedron", "Triangle"]
+        names += ["Polygon", "Hexahedron", "HexagonalPrism"]
+        grid = pv.merge(
+            [_make_skewed_cell(name, seed) for seed, name in enumerate(names)],
+            merge_points=False,
+        )
+
+        mesh = from_pyvista(
+            grid,
+            manifold_dim=0,
+            point_source="cell_centroids",
+            warn_on_lost_data=False,
+        )
+
+        expected = [
+            grid.points[grid.get_cell(i).point_ids].mean(axis=0)
+            for i in range(grid.n_cells)
+        ]
+        np.testing.assert_allclose(mesh.points.numpy(), expected, atol=1e-12)
+
+    def test_centroid_of_higher_order_cell_is_parametric_center(self):
+        """A curved quadratic edge is centered on its middle node, on the curve,
+        not at its vertex mean, off the curve."""
+        points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.25, 0.5, 0.0]])
+        grid = pv.UnstructuredGrid(
+            {pv.CellType.QUADRATIC_EDGE: np.array([[0, 1, 2]])}, points
+        )
+
+        mesh = from_pyvista(
+            grid,
+            manifold_dim=0,
+            point_source="cell_centroids",
+            warn_on_lost_data=False,
+        )
+
+        np.testing.assert_allclose(mesh.points.numpy(), [[0.25, 0.5, 0.0]])
+
 
 # ---------------------------------------------------------------------------
 # point_source="cell_centroids", manifold_dim=1 (dual graph)
@@ -270,8 +502,10 @@ class TestCellCentroidsPointCloud:
 
 class TestCellCentroidsDualGraph:
     """Centroid-based dual graph via from_pyvista: builds a 1D graph where cell
-    centroids are nodes and face-adjacent cell pairs are edges, with cell_data
-    remapped to point_data."""
+    centroids are nodes and facet-adjacent cell pairs are edges (a facet is a
+    face for volume cells, an edge for surface cells, a vertex for line cells),
+    with cell_data remapped to point_data. Covers volume, surface, and line
+    meshes to exercise the dimension-generic facet adjacency."""
 
     def test_dual_graph_two_hexes(self):
         """Two adjacent hexes sharing a face produce 1 dual-graph edge."""
@@ -301,7 +535,7 @@ class TestCellCentroidsDualGraph:
         assert mesh.point_data["zone"].shape[0] == 2
 
     def test_dual_graph_isolated_cell_no_edges(self):
-        """A single cell has no face-neighbors, so the dual graph has 0 edges."""
+        """A single cell has no facet-neighbors, so the dual graph has 0 edges."""
         pv_mesh = _make_tet_with_data()
         mesh = from_pyvista(
             pv_mesh,
@@ -312,6 +546,140 @@ class TestCellCentroidsDualGraph:
 
         assert mesh.n_points == 1
         assert mesh.n_cells == 0
+
+    def test_dual_graph_triangulated_surface(self):
+        """Surface cells share edges (1-faces), so a surface mesh has a non-empty
+        dual graph. Regression for the face-only bug, which returned 0 edges here
+        because triangles report ``GetNumberOfFaces() == 0``."""
+        surf = pv.Plane(i_resolution=2, j_resolution=2).triangulate()  # 8 triangles
+        mesh = from_pyvista(
+            surf,
+            manifold_dim=1,
+            point_source="cell_centroids",
+            warn_on_lost_data=False,
+        )
+
+        assert mesh.n_manifold_dims == 1
+        assert mesh.n_points == 8  # 8 triangles -> 8 centroids
+        assert mesh.cells.shape == (8, 2)
+        assert mesh.n_cells == 8  # edge-sharing adjacencies among the triangles
+
+    def test_dual_graph_quad_surface(self):
+        """A 2x2 grid of quads yields the expected 4-edge grid adjacency."""
+        surf = pv.Plane(i_resolution=2, j_resolution=2)  # 4 quads
+        mesh = from_pyvista(
+            surf,
+            manifold_dim=1,
+            point_source="cell_centroids",
+            warn_on_lost_data=False,
+        )
+
+        assert mesh.n_manifold_dims == 1
+        assert mesh.n_points == 4  # 4 quads -> 4 centroids
+        assert mesh.n_cells == 4  # 2 horizontal + 2 vertical neighbor pairs
+
+    def test_dual_graph_polyline(self):
+        """Full dimension-genericity: a polyline's cells (segments) share endpoint
+        vertices, so its dual graph is the segment-adjacency line graph."""
+        points = np.array(
+            [[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]], dtype=np.float64
+        )
+        # Three segments: (0, 1), (1, 2), (2, 3).
+        lines = np.array([2, 0, 1, 2, 1, 2, 2, 2, 3])
+        poly = pv.PolyData(points, lines=lines)
+        mesh = from_pyvista(
+            poly,
+            manifold_dim=1,
+            point_source="cell_centroids",
+            warn_on_lost_data=False,
+        )
+
+        assert mesh.n_manifold_dims == 1
+        assert mesh.n_points == 3  # 3 segments -> 3 centroids
+        assert mesh.n_cells == 2  # consecutive segments share a vertex
+
+    @staticmethod
+    def _simplex_dual_graph_cases() -> dict[str, "pv.DataSet"]:
+        rng = np.random.default_rng(0)
+        tets = pv.PolyData(rng.random((60, 3))).delaunay_3d()
+        # Shuffle the cells and permute each cell's vertices.
+        tet_cells = np.asarray(tets.cell_connectivity).reshape(-1, 4)
+        tet_cells = tet_cells[rng.permutation(len(tet_cells))][:, [2, 0, 3, 1]]
+        return {
+            "tet delaunay": tets,
+            "tet shuffled": pv.UnstructuredGrid(
+                {pv.CellType.TETRA: tet_cells}, tets.points
+            ),
+            "tri plane": pv.Plane(i_resolution=4, j_resolution=3).triangulate(),
+            # Four triangles share edge (0, 1); the last cell duplicates the first.
+            "tri non-manifold": pv.PolyData.from_regular_faces(
+                rng.random((7, 3)),
+                np.array(
+                    [[0, 1, 2], [1, 0, 3], [0, 1, 4], [5, 1, 0], [1, 2, 6], [0, 1, 2]]
+                ),
+            ),
+            "tri grid": pv.UnstructuredGrid(
+                {pv.CellType.TRIANGLE: np.array([[0, 1, 2], [2, 1, 3], [3, 1, 0]])},
+                rng.random((4, 3)),
+            ),
+            # Five lines share vertex 0.
+            "line star": pv.UnstructuredGrid(
+                {pv.CellType.LINE: np.array([[0, 1], [2, 0], [0, 3], [4, 0], [0, 5]])},
+                rng.random((6, 3)),
+            ),
+            "line polydata": pv.PolyData(
+                rng.random((5, 3)), lines=np.array([2, 0, 1, 2, 1, 2, 2, 3, 2, 2, 2, 4])
+            ),
+        }
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "tet delaunay",
+            "tet shuffled",
+            "tri plane",
+            "tri non-manifold",
+            "tri grid",
+            "line star",
+            "line polydata",
+        ],
+    )
+    @pytest.mark.parametrize("packed_keys", [True, False])
+    def test_simplex_fast_path_matches_vtk_loop(self, case, packed_keys, monkeypatch):
+        """The vectorized LINE/TRIANGLE/TETRA path gives the VTK loop's edges, in
+        order, both with packed int64 facet keys and with the tuple-lexsort fallback."""
+        import physicsnemo.mesh.io.io_pyvista as io_pyvista
+
+        pv_mesh = self._simplex_dual_graph_cases()[case]
+        simplex_cells = io_pyvista._homogeneous_simplex_cells(pv_mesh)
+        assert simplex_cells is not None
+        local_facets = io_pyvista._SIMPLEX_FACETS[simplex_cells.shape[1]]
+        assert io_pyvista._packed_facet_keys(simplex_cells, local_facets) is not None
+        if not packed_keys:
+            monkeypatch.setattr(io_pyvista, "_packed_facet_keys", lambda *_: None)
+        assert io_pyvista._simplex_dual_graph_edges(simplex_cells) is not None
+        fast = io_pyvista._build_dual_graph_edges(pv_mesh)
+
+        monkeypatch.setattr(io_pyvista, "_homogeneous_simplex_cells", lambda _: None)
+        reference = io_pyvista._build_dual_graph_edges(pv_mesh)
+
+        assert len(reference) > 0
+        assert fast.dtype == reference.dtype == torch.long
+        assert torch.equal(fast, reference)
+
+    def test_packed_facet_keys_fall_back_on_overflow(self):
+        """Facet keys that could overflow int64 are not packed."""
+        from physicsnemo.mesh.io.io_pyvista import _SIMPLEX_FACETS, _packed_facet_keys
+
+        cells = np.array([[0, 1, 2, 3], [1, 2, 3, 2**21]])
+        assert _packed_facet_keys(cells, _SIMPLEX_FACETS[4]) is None
+        assert _packed_facet_keys(cells[:, :3], _SIMPLEX_FACETS[3]) is not None
+
+    def test_simplex_fast_path_falls_back_on_repeated_vertex(self):
+        """A cell that repeats a vertex is left to the VTK loop."""
+        from physicsnemo.mesh.io.io_pyvista import _simplex_dual_graph_edges
+
+        assert _simplex_dual_graph_edges(np.array([[0, 1, 2], [1, 1, 3]])) is None
 
 
 # ---------------------------------------------------------------------------

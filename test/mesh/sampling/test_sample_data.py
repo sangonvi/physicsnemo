@@ -20,16 +20,21 @@ Tests validate barycentric coordinate computation and data sampling
 across spatial dimensions and compute backends.
 """
 
+import math
+
 import pytest
 import torch
 
 from physicsnemo.mesh.mesh import Mesh
+from physicsnemo.mesh.primitives.surfaces import torus
 from physicsnemo.mesh.sampling import (
     compute_barycentric_coordinates,
     find_all_containing_cells,
     find_containing_cells,
     sample_data_at_points,
 )
+from physicsnemo.mesh.sampling.sample_data import _accumulate_sampled_data
+from physicsnemo.mesh.spatial import BVH
 
 ### Helper Functions ###
 
@@ -242,6 +247,65 @@ class TestFindAllContainingCells:
         assert len(containing_list[0]) >= 1
 
 
+class TestManyCandidateCells:
+    """Containment queries where a point has more than 32 BVH candidate cells.
+
+    ``BVH.find_candidate_cells`` caps candidates per point at 32 by default.
+    The containment search must not apply that cap, or the cell that
+    contains the point can be dropped before the exact barycentric test.
+    """
+
+    def test_high_valence_vertex_default_bvh(self):
+        """Points near the hub of a 256-triangle fan are all found."""
+        ### Planar fan: every triangle shares the hub vertex at the origin, so
+        ### the AABB of every cell contains the region around the hub.
+        n = 256
+        angle = torch.arange(n) * (2 * math.pi / n)
+        rim_points = torch.stack([angle.cos(), angle.sin()], dim=1)
+        points = torch.cat([torch.zeros(1, 2), rim_points])
+        rim = 1 + torch.arange(n)
+        cells = torch.stack([torch.zeros(n, dtype=torch.long), rim, 1 + rim % n], dim=1)
+        mesh = Mesh(
+            points=points,
+            cells=cells,
+            cell_data={"id": torch.arange(n, dtype=torch.float32)},
+        )
+
+        ### One point per triangle, close to the hub and strictly inside
+        weights = torch.tensor([0.9, 0.05, 0.05])
+        queries = (weights[None, :, None] * points[cells]).sum(dim=1)
+        expected_cells = torch.arange(n)
+
+        cell_indices, _ = find_containing_cells(mesh, queries)
+        assert torch.equal(cell_indices, expected_cells)
+
+        containing = find_all_containing_cells(mesh, queries).to_list()
+        assert containing == [[i] for i in range(n)]
+
+        result = sample_data_at_points(mesh, queries, data_source="cells")
+        assert torch.equal(result["id"], expected_cells.float())
+
+    def test_prebuilt_bvh_large_leaf_size(self):
+        """All on-surface points are found with a prebuilt leaf_size=16 BVH."""
+        mesh = torus.load(n_major=64, n_minor=32)
+        mesh.cell_data["id"] = torch.arange(mesh.n_cells, dtype=torch.float32)
+        bvh = BVH.from_mesh(mesh, leaf_size=16)
+
+        ### One point per cell, with barycentric weights bounded away from zero
+        ### so that each point lies inside exactly one cell
+        generator = torch.Generator().manual_seed(0)
+        weights = 0.05 + torch.rand(mesh.n_cells, 3, generator=generator)
+        weights = weights / weights.sum(dim=1, keepdim=True)
+        queries = (weights.unsqueeze(-1) * mesh.points[mesh.cells]).sum(dim=1)
+        expected_cells = torch.arange(mesh.n_cells)
+
+        cell_indices, _ = find_containing_cells(mesh, queries, bvh=bvh)
+        assert torch.equal(cell_indices, expected_cells)
+
+        result = sample_data_at_points(mesh, queries, data_source="cells", bvh=bvh)
+        assert torch.equal(result["id"], expected_cells.float())
+
+
 class TestSampleAtPoints:
     """Tests for sampling data at query points."""
 
@@ -279,6 +343,7 @@ class TestSampleAtPoints:
         result = sample_data_at_points(mesh, queries, data_source="cells")
 
         ### Should get cell data values
+        assert result["temperature"].dtype == torch.float32
         assert torch.allclose(result["temperature"][0], torch.tensor(100.0))
         assert torch.allclose(result["temperature"][1], torch.tensor(200.0))
 
@@ -340,6 +405,89 @@ class TestSampleAtPoints:
         ### Should be NaN
         assert torch.isnan(result["temperature"][0])
 
+    @pytest.mark.parametrize(
+        ("field", "expected"),
+        [
+            (torch.tensor([7], dtype=torch.int64), 7.0),
+            (torch.tensor([True]), 1.0),
+        ],
+    )
+    def test_sample_discrete_cell_data_promotes_for_nan(self, field, expected):
+        """Integer and boolean fields must support the documented NaN sentinel."""
+        mesh = Mesh(
+            points=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+            cells=torch.tensor([[0, 1, 2]]),
+            cell_data={"label": field},
+        )
+        queries = torch.tensor([[0.2, 0.2], [2.0, 2.0]])
+
+        sampled = sample_data_at_points(mesh, queries, data_source="cells")["label"]
+
+        assert sampled.dtype == torch.float64
+        torch.testing.assert_close(
+            sampled[0], torch.tensor(expected, dtype=torch.float64)
+        )
+        assert torch.isnan(sampled[1])
+
+    def test_point_interpolation_promotes_field_and_geometry_dtypes(self):
+        """Barycentric interpolation follows PyTorch dtype promotion rules."""
+        mesh = Mesh(
+            points=torch.tensor(
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=torch.float64
+            ),
+            cells=torch.tensor([[0, 1, 2]]),
+            point_data={"value": torch.tensor([0.0, 3.0, 6.0], dtype=torch.float32)},
+        )
+        query = torch.tensor([[1.0 / 3.0, 1.0 / 3.0]], dtype=torch.float64)
+
+        sampled = sample_data_at_points(mesh, query, data_source="points")["value"]
+
+        assert sampled.dtype == torch.float64
+        torch.testing.assert_close(sampled, torch.tensor([3.0], dtype=torch.float64))
+
+    @pytest.mark.parametrize(
+        ("field", "expected"),
+        [
+            (torch.tensor([0, 3, 6], dtype=torch.int64), 3.0),
+            (torch.tensor([False, True, True]), 2.0 / 3.0),
+        ],
+    )
+    def test_sample_discrete_point_data_promotes_for_interpolation(
+        self, field, expected
+    ):
+        """Integer and boolean point fields interpolate in floating point."""
+        mesh = Mesh(
+            points=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+            cells=torch.tensor([[0, 1, 2]]),
+            point_data={"value": field},
+        )
+        query = torch.tensor([[1.0 / 3.0, 1.0 / 3.0]])
+
+        sampled = sample_data_at_points(mesh, query, data_source="points")["value"]
+
+        assert sampled.dtype == torch.float64
+        torch.testing.assert_close(
+            sampled, torch.tensor([expected], dtype=torch.float64), rtol=1e-6, atol=1e-6
+        )
+
+    def test_sampling_preserves_field_gradients(self):
+        """Accumulation remains differentiable with respect to sampled fields."""
+        values = torch.tensor([0.0, 3.0, 6.0], requires_grad=True)
+        mesh = Mesh(
+            points=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+            cells=torch.tensor([[0, 1, 2]]),
+            point_data={"value": values},
+        )
+
+        sampled = sample_data_at_points(
+            mesh,
+            torch.tensor([[1.0 / 3.0, 1.0 / 3.0]]),
+            data_source="points",
+        )["value"]
+        sampled.sum().backward()
+
+        torch.testing.assert_close(values.grad, torch.full((3,), 1.0 / 3.0))
+
     def test_sample_multidimensional_data(self):
         """Test sampling multi-dimensional data arrays."""
         ### Create a triangle with vector point data
@@ -395,6 +543,95 @@ class TestSampleAtPoints:
 
         ### Should get a value (might be average if both cells contain it)
         assert not torch.isnan(result["temperature"][0])
+
+    def test_discrete_multiple_cells_strategy_mean(self):
+        """Averaging discrete cell data can produce a non-integral value."""
+        mesh = Mesh(
+            points=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.5, -1.0]]),
+            cells=torch.tensor([[0, 1, 2], [0, 1, 3]]),
+            cell_data={"label": torch.tensor([1, 2])},
+        )
+
+        result = sample_data_at_points(
+            mesh,
+            torch.tensor([[0.5, 0.0]]),
+            data_source="cells",
+            multiple_cells_strategy="mean",
+        )
+
+        assert result["label"].dtype == torch.float64
+        torch.testing.assert_close(
+            result["label"], torch.tensor([1.5], dtype=torch.float64)
+        )
+
+    def test_complex_multiple_cells_strategy_mean(self):
+        """Complex cell data retains its dtype when averaged."""
+        mesh = Mesh(
+            points=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.5, -1.0]]),
+            cells=torch.tensor([[0, 1, 2], [0, 1, 3]]),
+            cell_data={"value": torch.tensor([1.0 + 2.0j, 3.0 + 4.0j])},
+        )
+
+        result = sample_data_at_points(
+            mesh,
+            torch.tensor([[0.5, 0.0]]),
+            data_source="cells",
+            multiple_cells_strategy="mean",
+        )
+
+        assert result["value"].dtype == torch.complex64
+        torch.testing.assert_close(
+            result["value"], torch.tensor([2.0 + 3.0j], dtype=torch.complex64)
+        )
+
+    def test_discrete_multiple_cells_strategy_nan(self):
+        """The nan strategy rejects ambiguous discrete cell data."""
+        mesh = Mesh(
+            points=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0], [0.5, -1.0]]),
+            cells=torch.tensor([[0, 1, 2], [0, 1, 3]]),
+            cell_data={"label": torch.tensor([1, 2])},
+        )
+
+        result = sample_data_at_points(
+            mesh,
+            torch.tensor([[0.5, 0.0]]),
+            data_source="cells",
+            multiple_cells_strategy="nan",
+        )
+
+        assert result["label"].dtype == torch.float64
+        assert torch.isnan(result["label"][0])
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+    def test_accumulation_does_not_synchronize_cuda_masks(self):
+        mesh = Mesh(
+            points=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], device="cuda"),
+            cells=torch.tensor([[0, 1, 2], [0, 2, 1]], device="cuda"),
+            cell_data={
+                f"field_{i}": torch.tensor([1.0, 2.0], device="cuda") for i in range(8)
+            },
+        )
+        query_indices = torch.tensor([0, 1, 1], device="cuda")
+        cell_indices = torch.tensor([0, 0, 1], device="cuda")
+
+        torch.cuda.synchronize()
+        previous = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            result = _accumulate_sampled_data(
+                mesh,
+                n_queries=2,
+                query_indices=query_indices,
+                cell_indices=cell_indices,
+                bary_coords=None,
+                data_source="cells",
+                multiple_cells_strategy="nan",
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
+        torch.cuda.synchronize()
+
+        assert result.batch_size == torch.Size([2])
 
     def test_skip_cached_properties(self):
         """Test that cached properties stored in _cache are skipped."""

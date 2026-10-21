@@ -24,14 +24,18 @@ Both use tensorclass .load(path) directly; no conversion from other formats.
 
 from __future__ import annotations
 
+import glob as _glob
 import logging
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 import torch
 
+from physicsnemo.datapipes._indexing import _cyclic_block_indices
+from physicsnemo.datapipes._rng import spawn_generator
 from physicsnemo.datapipes.registry import register
 from physicsnemo.mesh import DomainMesh, Mesh
+from physicsnemo.mesh.calculus.measure import EFFECTIVE_MEASURE_KEY, scale_measures
 
 logger = logging.getLogger(__name__)
 
@@ -41,49 +45,46 @@ DEFAULT_MESH_EXTENSION = ".pmsh"
 DEFAULT_DOMAIN_MESH_EXTENSION = ".pdmsh"
 
 
-def _contiguous_block_slice(
-    total: int,
-    k: int,
-    generator: torch.Generator | None = None,
-) -> slice:
-    """Return a random contiguous ``slice`` of length *k* within ``[0, total)``.
-
-    A contiguous slice produces sequential I/O on memmap-backed tensors,
-    which is orders of magnitude faster than scattered fancy-indexing.
-    For best results the on-disk point order should be pre-shuffled so
-    that a contiguous block is spatially representative.
-    """
-    if total <= k:
-        return slice(0, total)
-    start = torch.randint(0, total - k + 1, (1,), generator=generator).item()
-    return slice(start, start + k)
-
-
 def _subsample_mesh_points(
     mesh: Mesh,
     n_points: int,
     generator: torch.Generator | None = None,
 ) -> Mesh:
-    """Subsample a Mesh to *n_points* via a contiguous block read.
+    """Subsample a Mesh to *n_points* via a cyclic contiguous block read.
 
-    Uses a contiguous slice for sequential I/O on memmap-backed data.
+    Uses one or two contiguous runs for page-sequential I/O on memmap-backed
+    data while giving every point the same inclusion probability.
     For point clouds (``n_cells == 0``) this avoids the heavy
     cell-remapping logic in :meth:`Mesh.slice_points` which allocates
     two *N*-element intermediate tensors.  For meshes with cells it
     falls back to ``slice_points``.
+
+    Unlike :func:`_subsample_mesh_cells`, this does NOT maintain
+    cell-measure corrections: dropping points removes cells implicitly, with
+    no per-cell inclusion probability to invert.  Prefer cell
+    subsampling when downstream code integrates over the mesh.
     """
     if mesh.n_points <= n_points:
         return mesh
-    sl = _contiguous_block_slice(mesh.n_points, n_points, generator=generator)
+    indices = _cyclic_block_indices(
+        mesh.n_points,
+        n_points,
+        generator=generator,
+        device=mesh.points.device,
+    )
     if mesh.n_cells == 0:
-        return Mesh(
-            points=mesh.points[sl],
+        result = Mesh(
+            points=mesh.points[indices],
             cells=mesh.cells,
-            point_data=mesh.point_data[sl],
+            point_data=mesh.point_data[indices],
             cell_data=mesh.cell_data,
             global_data=mesh.global_data,
         )
-    return mesh.slice_points(torch.arange(sl.start, sl.stop, device=mesh.points.device))
+    else:
+        result = mesh.slice_points(indices)
+    if EFFECTIVE_MEASURE_KEY in result.point_data:
+        scale_measures(result, mesh.n_points / n_points, association="points")
+    return result
 
 
 def _subsample_mesh_cells(
@@ -91,27 +92,128 @@ def _subsample_mesh_cells(
     n_cells: int,
     generator: torch.Generator | None = None,
 ) -> Mesh:
-    """Subsample a Mesh to *n_cells* via a contiguous block read on cells.
+    """Subsample a Mesh to *n_cells* via a cyclic contiguous block read on cells.
 
     Preserves cell topology: each selected cell retains its full vertex
     connectivity.  Unreferenced points are compacted out.  Uses
-    ``_contiguous_block_slice`` for sequential I/O on memmap-backed
-    cell tensors.
+    :func:`_cyclic_block_indices` for (page-)sequential I/O on
+    memmap-backed cell tensors.
+
+    Preserves the mesh's integration measure: every cell's inclusion
+    probability is exactly ``k/N``, and the retained cells' measure
+    (see :mod:`physicsnemo.mesh.calculus.measure`) is multiplied by
+    ``N/k``, composing with corrections from earlier sampling stages.
+    Consumers of the effective cell measure (see
+    :mod:`physicsnemo.mesh.calculus.measure`) then see an unbiased estimate
+    of the full-mesh measure rather than the ~``k/N`` retained fraction.
 
     Use this instead of :func:`_subsample_mesh_points` when the mesh
     has cell connectivity (triangulated surfaces, volume meshes) and
     downstream transforms or outputs depend on cell topology (e.g.
     surface normals, cell centroids, cell_data fields).
     """
-    if mesh.n_cells <= n_cells:
+    n_total = mesh.n_cells
+    if n_total <= n_cells:
         return mesh
-    sl = _contiguous_block_slice(mesh.n_cells, n_cells, generator=generator)
-    mesh = mesh.slice_cells(sl)
+    indices = _cyclic_block_indices(
+        n_total,
+        n_cells,
+        generator=generator,
+        device=mesh.cells.device,
+    )
+    mesh = mesh.slice_cells(indices)
     # Compact: drop vertices not referenced by any surviving cell
     referenced = torch.unique(mesh.cells)
     if referenced.numel() < mesh.n_points:
         mesh = mesh.slice_points(referenced)
+    ### Compose the Horvitz-Thompson weight for this sampling stage.
+    ### slice_cells/slice_points returned fresh TensorDicts, so the
+    ### in-place update cannot leak into the memmap-backed source.
+    scale_measures(mesh, n_total / n_cells)
     return mesh
+
+
+def _indices_to_runs(indices: torch.Tensor) -> list[tuple[int, int]]:
+    """Convert cyclic-block indices (1-2 ascending contiguous runs) to runs."""
+    breaks = torch.nonzero(indices[1:] != indices[:-1] + 1).flatten()
+    starts = [0] + [int(b) + 1 for b in breaks]
+    ends = [int(b) + 1 for b in breaks] + [len(indices)]
+    return [(int(indices[s]), int(indices[e - 1]) + 1) for s, e in zip(starts, ends)]
+
+
+def _zarr_mesh_subsampled(
+    group,
+    n_cells: int | None,
+    n_points: int | None,
+    generator: torch.Generator | None,
+    drop_cells: bool = False,
+) -> Mesh:
+    """Partial-read a zarr mesh group: fetch only the subsample window.
+
+    Reproduces :func:`_subsample_mesh` semantics (cyclic contiguous blocks,
+    vertex compaction, Horvitz-Thompson measure corrections) while reading only
+    the selected rows from the store instead of materializing the full mesh.
+    The generator advances as in :func:`_subsample_mesh`, so a seed selects the
+    same rows as on the memmap path. ``drop_cells`` reads the mesh as a point
+    cloud, as ``DomainMeshReader(drop_interior_cells=True)`` does.
+    """
+    from physicsnemo.mesh.io import io_zarr as _ioz
+
+    total_cells = group["cells"].shape[0] if "cells" in group and not drop_cells else 0
+    total_points = group["points"].shape[0]
+
+    if total_cells > 0 and n_cells is not None and total_cells > n_cells:
+        indices = _cyclic_block_indices(total_cells, n_cells, generator=generator)
+        runs = _indices_to_runs(indices)
+        cells = _ioz._read_rows(group["cells"], runs)
+        # Compact: gather only referenced vertices; remap connectivity to the
+        # sorted-unique order, matching slice_cells + slice_points.
+        referenced, inverse = torch.unique(cells, return_inverse=True)
+        cells = inverse.reshape(cells.shape)
+        ref_np = referenced.numpy()
+        mesh = Mesh(
+            points=_ioz._read_index(group["points"], ref_np),
+            cells=cells,
+            point_data=_ioz._read_tree(
+                group, "point_data", leaf_reader=lambda a: _ioz._read_index(a, ref_np)
+            ),
+            cell_data=_ioz._read_tree(
+                group, "cell_data", leaf_reader=lambda a: _ioz._read_rows(a, runs)
+            ),
+            global_data=_ioz._read_tree(group, "global_data"),
+        )
+        scale_measures(mesh, total_cells / n_cells)
+        if n_points is not None:
+            mesh = _subsample_mesh_points(mesh, n_points, generator=generator)
+        return mesh
+
+    if total_cells == 0 and n_points is not None and total_points > n_points:
+        indices = _cyclic_block_indices(total_points, n_points, generator=generator)
+        runs = _indices_to_runs(indices)
+        mesh = Mesh(
+            points=_ioz._read_rows(group["points"], runs),
+            point_data=_ioz._read_tree(
+                group, "point_data", leaf_reader=lambda a: _ioz._read_rows(a, runs)
+            ),
+            cell_data=None if drop_cells else _ioz._read_tree(group, "cell_data"),
+            global_data=_ioz._read_tree(group, "global_data"),
+        )
+        if EFFECTIVE_MEASURE_KEY in mesh.point_data:
+            scale_measures(mesh, total_points / n_points, association="points")
+        return mesh
+
+    # No window read applies (small mesh, or a point subsample of a mesh with
+    # cells): read in full and subsample in memory, as the memmap path does.
+    # Subsampling here, not in __getitem__, keeps the generator's draws in
+    # sub-mesh order, so later sub-meshes also select the memmap path's rows.
+    mesh = _ioz._mesh_from_group(group, None)
+    if drop_cells:
+        mesh = Mesh(
+            points=mesh.points,
+            point_data=mesh.point_data,
+            global_data=mesh.global_data,
+        )
+    return _subsample_mesh(mesh, n_cells, n_points, generator=generator)
 
 
 def _subsample_mesh(
@@ -167,19 +269,22 @@ class MeshReader:
             If True, include sample index in metadata.
         subsample_n_points : int, optional
             If set, subsample the mesh to this many points *before*
-            ``pin_memory``.  Uses contiguous block reads for sequential
-            I/O on memmap-backed data.  Appropriate for point clouds
+            ``pin_memory``.  Uses cyclic contiguous block reads for
+            page-sequential I/O on memmap-backed data, with uniform point
+            inclusion probability.  Appropriate for point clouds
             or meshes where cell topology is not needed downstream.
             For best results, pre-shuffle the on-disk point order so
             that a contiguous block is spatially representative.
         subsample_n_cells : int, optional
             If set, subsample the mesh to this many cells *before*
-            ``pin_memory``.  Uses contiguous block reads on the cell
-            tensor for sequential I/O, then compacts unreferenced
+            ``pin_memory``.  Uses cyclic contiguous block reads on the
+            cell tensor for sequential I/O, then compacts unreferenced
             vertices.  Preserves cell topology and is the correct
             choice for triangulated surface meshes where downstream
             transforms depend on cells (e.g. surface normals, cell
-            centroids, cell_data fields).  Applied before
+            centroids, cell_data fields).  Records the inverse inclusion
+            probability to effective measures, preserving the integration
+            measure (see :mod:`physicsnemo.mesh.calculus.measure`).  Applied before
             ``subsample_n_points`` when both are set.
         """
         self._root = Path(path)
@@ -188,21 +293,62 @@ class MeshReader:
         self.include_index_in_metadata = include_index_in_metadata
         self.subsample_n_points = subsample_n_points
         self.subsample_n_cells = subsample_n_cells
-        self._subsample_generator: torch.Generator | None = None
+        # Base seed + epoch for deterministic per-index RNG (see
+        # :meth:`set_generator`). ``None`` means unseeded.
+        self._seed_base: int | None = None
+        self._epoch: int = 0
 
         if not self._root.exists():
             raise FileNotFoundError(f"Path not found: {self._root}")
         if not self._root.is_dir():
             raise ValueError(f"Path must be a directory: {self._root}")
 
-        self._paths = sorted(self._root.glob(pattern))
+        # glob.glob instead of Path.glob: the latter re-stats each entry and
+        # silently drops entries under Lustre metadata-server load.
+        self._paths = sorted(
+            Path(p) for p in _glob.glob(str(self._root / pattern), recursive=True)
+        )
         if not self._paths:
             raise ValueError(f"No paths matching {pattern!r} found in {self._root}")
 
     def _load_sample(self, index: int) -> Mesh:
         """Load a single Mesh from disk."""
         mesh_path = self._paths[index]
-        return Mesh.load(mesh_path)
+        if (mesh_path / "zarr.json").exists():
+            from physicsnemo.mesh.io import from_zarr, io_zarr
+
+            if (
+                self.subsample_n_cells is not None
+                or self.subsample_n_points is not None
+            ):
+                # Push the subsample into the read: fetch only the selected
+                # window from the store. The generator derivation matches
+                # __getitem__, so the draw is identical to subsampling after
+                # an eager load (whose subsample then no-ops).
+                # Cache opened store handles: re-opening walks the store's
+                # group-metadata chain, and on networked filesystems every
+                # uncached lookup is a metadata-server round-trip per draw.
+                cache = getattr(self, "_zarr_groups", None)
+                if cache is None:
+                    cache = self._zarr_groups = {}
+                group = cache.get(mesh_path)
+                if group is None:
+                    group = cache[mesh_path] = io_zarr._open_group(mesh_path)
+                generator = (
+                    None
+                    if self._seed_base is None
+                    else spawn_generator(self._seed_base, self._epoch, index)
+                )
+                return _zarr_mesh_subsampled(
+                    group,
+                    self.subsample_n_cells,
+                    self.subsample_n_points,
+                    generator,
+                )
+            return from_zarr(mesh_path)
+        # mode="r": copy-on-write maps, so in-place edits of a sample never
+        # reach the dataset files, and readers on Lustre take no write locks.
+        return Mesh.load(mesh_path, mode="r")
 
     def _get_sample_metadata(self, index: int) -> dict[str, Any]:
         """Return metadata for the sample (e.g. source path)."""
@@ -212,38 +358,43 @@ class MeshReader:
         return len(self._paths)
 
     def set_generator(self, generator: torch.Generator) -> None:
-        """Assign a ``torch.Generator`` for reproducible subsampling.
+        """Assign a base seed for reproducible, order-independent subsampling.
 
         Called by :class:`MeshDataset` when the DataLoader provides a
-        seed.  Replaces any previously assigned generator.
+        seed.  Stores ``generator.initial_seed()`` as the base seed; each
+        sample then derives its own generator from
+        ``(base_seed, epoch, index)``, so subsampling is reproducible
+        regardless of read order or worker thread.
 
         Parameters
         ----------
         generator : torch.Generator
-            Generator to use for contiguous block selection.
+            Generator whose ``initial_seed()`` seeds all per-sample RNG.
         """
-        self._subsample_generator = generator
+        self._seed_base = generator.initial_seed()
 
     def set_epoch(self, epoch: int) -> None:
-        """Reseed the subsample RNG for a new epoch.
+        """Set the epoch used to vary per-sample RNG deterministically.
 
-        Produces a different (but deterministic) sequence of contiguous
-        blocks each epoch when a generator has been assigned via
-        :meth:`set_generator`.
+        The epoch is folded into each sample's derived seed, producing a
+        different (but deterministic) sequence of contiguous blocks each
+        epoch when a base seed has been assigned via :meth:`set_generator`.
         """
-        if self._subsample_generator is not None:
-            self._subsample_generator.manual_seed(
-                self._subsample_generator.initial_seed() + epoch
-            )
+        self._epoch = epoch
 
     def __getitem__(self, index: int) -> tuple[Mesh, dict[str, Any]]:
         mesh = self._load_sample(index)
 
+        generator = (
+            None
+            if self._seed_base is None
+            else spawn_generator(self._seed_base, self._epoch, index)
+        )
         mesh = _subsample_mesh(
             mesh,
             self.subsample_n_cells,
             self.subsample_n_points,
-            generator=self._subsample_generator,
+            generator=generator,
         )
 
         if self.pin_memory:
@@ -285,7 +436,10 @@ class DomainMeshReader:
         include_index_in_metadata: bool = True,
         subsample_n_points: int | None = None,
         subsample_n_cells: int | None = None,
+        boundary_subsample: Literal["both", "cells", "points"] = "both",
         extra_boundaries: dict[str, dict] | None = None,
+        drop_interior_cells: bool = False,
+        drop_in_file_boundaries: bool = False,
     ) -> None:
         """
         Initialize the domain mesh reader.
@@ -305,19 +459,36 @@ class DomainMeshReader:
         subsample_n_points : int, optional
             If set, subsample the interior and each boundary mesh to
             at most this many points *before* ``pin_memory``.  Uses
-            contiguous block reads for sequential I/O on memmap-backed
-            data.  Appropriate for point clouds or meshes where cell
-            topology is not needed downstream.  For best results,
+            cyclic contiguous block reads for page-sequential I/O on
+            memmap-backed data, with uniform point inclusion probability.
+            Appropriate for point clouds or meshes where cell topology is
+            not needed downstream.  For best results,
             pre-shuffle the on-disk point order so that a contiguous
             block is spatially representative.
         subsample_n_cells : int, optional
             If set, subsample the interior and each boundary mesh to
             at most this many cells *before* ``pin_memory``.  Uses
-            contiguous block reads on cell tensors for sequential I/O,
-            then compacts unreferenced vertices.  Preserves cell
-            topology and is the correct choice when downstream
-            transforms depend on cells.  Applied before
+            cyclic contiguous block reads on cell tensors for
+            sequential I/O, then compacts unreferenced vertices.
+            Preserves cell topology and is the correct choice when
+            downstream transforms depend on cells.  Records the
+            inverse inclusion probability to effective measures, preserving
+            the integration measure (see
+            :mod:`physicsnemo.mesh.calculus.measure`).  Applied
+            before
             ``subsample_n_points`` when both are set.
+        boundary_subsample : {"both", "cells", "points"}, default="both"
+            Which of the two subsamples apply to the in-file boundary
+            meshes.  ``"both"`` applies ``subsample_n_cells`` then
+            ``subsample_n_points`` (the historical behaviour);
+            ``"cells"`` applies only ``subsample_n_cells``; ``"points"``
+            applies only ``subsample_n_points``.  The interior is
+            unaffected.  Use ``"cells"`` when both sizes are set to the
+            same ``N`` for a point-cloud interior next to a triangulated
+            boundary: composing cells-then-points on that boundary keeps
+            only the cells whose vertices *all* survive the point cut, so
+            a surface meant to keep ``N`` cells (about ``3N`` vertices)
+            keeps roughly ``N * (N / 3N)**3 ≈ N / 27`` of them.
         extra_boundaries : dict[str, dict] or None, optional
             Load additional sibling meshes as extra boundaries on each
             sample.  Each key is the boundary name to assign; each value
@@ -332,14 +503,47 @@ class DomainMeshReader:
                 extra_boundaries:
                   stl_geometry:
                     pattern: "*_single_solid.stl.pmsh"
+        drop_interior_cells : bool, default=False
+            If True, discard the interior mesh's cell connectivity (and
+            cell_data) immediately after load, turning it into a point
+            cloud.  This makes ``subsample_n_points`` take the cheap
+            contiguous-block path instead of the expensive
+            ``slice_points`` remap (which allocates an ``n_points`` map
+            and scatter-reads the full cell array from the memmap).  Use
+            for point-based models that consume only ``interior.points``
+            and ``interior.point_data`` (e.g. GeoTransolver volume) and
+            never the interior tet/cell topology.  Boundaries are
+            unaffected, so surface normals etc. still work.
+        drop_in_file_boundaries : bool, default=False
+            If True, discard the boundaries stored *in* the DomainMesh
+            file immediately after load (before subsampling and pinning).
+            ``extra_boundaries`` are added afterwards and are therefore
+            unaffected.  Use when the model consumes only the interior
+            (plus any ``extra_boundaries``) and never the in-file
+            boundaries -- e.g. a volume pipeline whose SDF comes from an
+            injected STL, where the in-file car-surface boundary would
+            otherwise be subsampled (an expensive ``slice_points`` remap,
+            GIL-held, that blocks worker-thread overlap) and pinned every
+            sample for nothing.
         """
         self._root = Path(path)
         self._pattern = pattern
         self.pin_memory = pin_memory
         self.include_index_in_metadata = include_index_in_metadata
+        self.drop_interior_cells = drop_interior_cells
+        self.drop_in_file_boundaries = drop_in_file_boundaries
         self.subsample_n_points = subsample_n_points
         self.subsample_n_cells = subsample_n_cells
-        self._subsample_generator: torch.Generator | None = None
+        if boundary_subsample not in ("both", "cells", "points"):
+            raise ValueError(
+                "boundary_subsample must be one of 'both', 'cells', 'points'; "
+                f"got {boundary_subsample!r}"
+            )
+        self.boundary_subsample = boundary_subsample
+        # Base seed + epoch for deterministic per-index RNG (see
+        # :meth:`set_generator`). ``None`` means unseeded.
+        self._seed_base: int | None = None
+        self._epoch: int = 0
         self._extra_boundaries = extra_boundaries or {}
 
         if not self._root.exists():
@@ -347,57 +551,157 @@ class DomainMeshReader:
         if not self._root.is_dir():
             raise ValueError(f"Path must be a directory: {self._root}")
 
-        self._paths = sorted(self._root.glob(pattern))
+        # glob.glob instead of Path.glob: the latter re-stats each entry and
+        # silently drops entries under Lustre metadata-server load.
+        self._paths = sorted(
+            Path(p) for p in _glob.glob(str(self._root / pattern), recursive=True)
+        )
         if not self._paths:
             raise ValueError(f"No paths matching {pattern!r} found in {self._root}")
 
+    def _boundary_subsample_sizes(self) -> tuple[int | None, int | None]:
+        """``(n_cells, n_points)`` to apply to boundaries per ``boundary_subsample``."""
+        n_cells = (
+            self.subsample_n_cells if self.boundary_subsample != "points" else None
+        )
+        n_points = (
+            self.subsample_n_points if self.boundary_subsample != "cells" else None
+        )
+        return n_cells, n_points
+
     def _load_sample(self, index: int) -> DomainMesh:
         """Load a single DomainMesh from disk."""
-        return DomainMesh.load(self._paths[index])
+        path = self._paths[index]
+        if (path / "zarr.json").exists():
+            from physicsnemo.mesh.io import from_zarr, io_zarr
+
+            if (
+                self.subsample_n_cells is not None
+                or self.subsample_n_points is not None
+            ):
+                # Push the subsample into the read (window reads per
+                # sub-mesh); drop flags are honored at read time so skipped
+                # data is never fetched. Generator derivation and sub-mesh
+                # order match __getitem__, whose subsample then no-ops.
+                generator = (
+                    None
+                    if self._seed_base is None
+                    else spawn_generator(self._seed_base, self._epoch, index)
+                )
+                cache = getattr(self, "_zarr_groups", None)
+                if cache is None:
+                    cache = self._zarr_groups = {}
+                root = cache.get(path)
+                if root is None:
+                    root = cache[path] = io_zarr._open_group(path)
+                interior = _zarr_mesh_subsampled(
+                    root["interior"],
+                    self.subsample_n_cells,
+                    self.subsample_n_points,
+                    generator,
+                    drop_cells=self.drop_interior_cells,
+                )
+                boundaries = {}
+                if not self.drop_in_file_boundaries and "boundaries" in root:
+                    bnd_n_cells, bnd_n_points = self._boundary_subsample_sizes()
+                    boundaries = {
+                        name: _zarr_mesh_subsampled(
+                            grp,
+                            bnd_n_cells,
+                            bnd_n_points,
+                            generator,
+                        )
+                        for name, grp in root["boundaries"].groups()
+                    }
+                return DomainMesh(
+                    interior=interior,
+                    boundaries=boundaries,
+                    global_data=io_zarr._read_tree(root, "global_data"),
+                )
+            return from_zarr(path)
+        return DomainMesh.load(path, mode="r")  # see MeshReader._load_sample
 
     def __len__(self) -> int:
         return len(self._paths)
 
     def set_generator(self, generator: torch.Generator) -> None:
-        """Assign a ``torch.Generator`` for reproducible subsampling.
+        """Assign a base seed for reproducible, order-independent subsampling.
 
         Called by :class:`MeshDataset` when the DataLoader provides a
-        seed.  Replaces any previously assigned generator.
+        seed.  Stores ``generator.initial_seed()`` as the base seed; each
+        sample then derives its own generator from
+        ``(base_seed, epoch, index)``, so subsampling is reproducible
+        regardless of read order or worker thread.
 
         Parameters
         ----------
         generator : torch.Generator
-            Generator to use for contiguous block selection.
+            Generator whose ``initial_seed()`` seeds all per-sample RNG.
         """
-        self._subsample_generator = generator
+        self._seed_base = generator.initial_seed()
 
     def set_epoch(self, epoch: int) -> None:
-        """Reseed the subsample RNG for a new epoch.
+        """Set the epoch used to vary per-sample RNG deterministically.
 
-        Produces a different (but deterministic) sequence of contiguous
-        blocks each epoch when a generator has been assigned via
-        :meth:`set_generator`.
+        The epoch is folded into each sample's derived seed, producing a
+        different (but deterministic) sequence of contiguous blocks each
+        epoch when a base seed has been assigned via :meth:`set_generator`.
         """
-        if self._subsample_generator is not None:
-            self._subsample_generator.manual_seed(
-                self._subsample_generator.initial_seed() + epoch
-            )
+        self._epoch = epoch
 
     def __getitem__(self, index: int) -> tuple[DomainMesh, dict[str, Any]]:
         dm = self._load_sample(index)
 
+        # Trim unused data before subsample/pin. Both references are lazy (no
+        # memmap materialization here):
+        #  - drop_interior_cells: turn the interior into a point cloud so its
+        #    point subsample takes the cheap contiguous-block path instead of a
+        #    full slice_points remap + scattered reads.
+        #  - drop_in_file_boundaries: skip the in-file boundaries entirely so we
+        #    don't subsample (an expensive, GIL-held slice_points remap that
+        #    starves worker-thread overlap) or pin a surface the model ignores.
+        if (self.drop_interior_cells and dm.interior.n_cells > 0) or (
+            self.drop_in_file_boundaries and len(dm.boundary_names) > 0
+        ):
+            interior = dm.interior
+            if self.drop_interior_cells and interior.n_cells > 0:
+                interior = Mesh(
+                    points=interior.points,
+                    point_data=interior.point_data,
+                    global_data=interior.global_data,
+                )
+            boundaries = {} if self.drop_in_file_boundaries else dm.boundaries
+            dm = DomainMesh(
+                interior=interior,
+                boundaries=boundaries,
+                global_data=dm.global_data,
+            )
+
         if self.subsample_n_cells is not None or self.subsample_n_points is not None:
-            sub_kw = dict(
+            generator = (
+                None
+                if self._seed_base is None
+                else spawn_generator(self._seed_base, self._epoch, index)
+            )
+            interior = _subsample_mesh(
+                dm.interior,
                 n_cells=self.subsample_n_cells,
                 n_points=self.subsample_n_points,
-                generator=self._subsample_generator,
+                generator=generator,
             )
+            bnd_n_cells, bnd_n_points = self._boundary_subsample_sizes()
+            boundaries = {
+                name: _subsample_mesh(
+                    dm.boundaries[name],
+                    n_cells=bnd_n_cells,
+                    n_points=bnd_n_points,
+                    generator=generator,
+                )
+                for name in dm.boundary_names
+            }
             dm = DomainMesh(
-                interior=_subsample_mesh(dm.interior, **sub_kw),
-                boundaries={
-                    name: _subsample_mesh(dm.boundaries[name], **sub_kw)
-                    for name in dm.boundary_names
-                },
+                interior=interior,
+                boundaries=boundaries,
                 global_data=dm.global_data,
             )
 
@@ -442,7 +746,12 @@ class DomainMeshReader:
                     glob_pattern,
                     matches[0],
                 )
-            new_boundaries[bnd_name] = Mesh.load(matches[0])
+            if (matches[0] / "zarr.json").exists():
+                from physicsnemo.mesh.io import from_zarr
+
+                new_boundaries[bnd_name] = from_zarr(matches[0])
+            else:
+                new_boundaries[bnd_name] = Mesh.load(matches[0], mode="r")
 
         return DomainMesh(
             interior=dm.interior,

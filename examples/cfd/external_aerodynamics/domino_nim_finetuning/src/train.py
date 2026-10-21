@@ -35,13 +35,12 @@ import torchinfo
 
 from typing import Literal, Any
 
-import apex
 import numpy as np
 import hydra
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -618,7 +617,7 @@ def validation_step(
         for i_batch, sample_batched in enumerate(dataloader):
             sampled_batched = dict_to_device(sample_batched, device)
 
-            with autocast(enabled=False):
+            with autocast("cuda", enabled=False):
                 if add_physics_loss:
                     prediction_vol, prediction_surf = model(
                         sampled_batched, return_volume_neighbors=True
@@ -683,7 +682,7 @@ def train_epoch(
             autocast_enabled = False
         else:
             autocast_enabled = True
-        with autocast(enabled=autocast_enabled):
+        with autocast("cuda", enabled=autocast_enabled):
             with nvtx.range("Model Forward Pass"):
                 if add_physics_loss:
                     prediction_vol, prediction_surf = model(
@@ -915,8 +914,9 @@ def main(cfg: DictConfig) -> None:
             static_graph=True,
         )
 
-    # optimizer = apex.optimizers.FusedAdam(model.parameters(), lr=0.001)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=0.001, fused=torch.cuda.is_available()
+    )
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=[50, 100, 200, 250, 300, 350, 400, 450], gamma=0.5
     )

@@ -20,7 +20,6 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 from jaxtyping import Float, Int
 
 if TYPE_CHECKING:
@@ -111,10 +110,14 @@ def sample_random_points_on_cells(
     n_samples = len(cell_indices)
 
     ### Sample from Gamma(alpha, 1) distribution and normalize to get Dirichlet
-    # When alpha=1, Gamma(1,1) is equivalent to Exponential(1), which is more efficient
+    # When alpha=1, Gamma(1,1) is equivalent to Exponential(1), which is more efficient.
+    # Build the distribution parameters in the mesh's dtype so the barycentric
+    # weights match the mesh precision (otherwise a float64 mesh silently samples
+    # weights in float32, halving precision).
+    dtype = mesh.points.dtype
     if alpha == 1.0:
         distribution = torch.distributions.Exponential(
-            rate=torch.ones((), device=mesh.points.device),
+            rate=torch.ones((), device=mesh.points.device, dtype=dtype),
         )
     else:
         if torch.compiler.is_compiling():
@@ -124,16 +127,24 @@ def sample_random_points_on_cells(
                 f"when using torch.compile. Use alpha=1.0 (uniform distribution) instead, or disable torch.compile.\n"
                 f"See https://github.com/pytorch/pytorch/issues/165751."
             )
-        _rate = torch.ones((), device=mesh.points.device)
+        _rate = torch.ones((), device=mesh.points.device, dtype=dtype)
         distribution = torch.distributions.Gamma(
-            concentration=torch.full((), alpha, device=mesh.points.device),
+            concentration=torch.full((), alpha, device=mesh.points.device, dtype=dtype),
             rate=_rate,
         )
 
     raw_barycentric_coords = distribution.sample((n_samples, mesh.n_manifold_dims + 1))
 
     ### Normalize so they sum to 1
-    barycentric_coords = F.normalize(raw_barycentric_coords, p=1, dim=-1)
+    # By the actual sums: small alpha gives rows with tiny sums, which an eps
+    # floor (as in F.normalize) would leave summing to less than 1, outside
+    # the cell. A row that is all zero falls back to the cell's centroid.
+    sums = raw_barycentric_coords.sum(dim=-1, keepdim=True)
+    barycentric_coords = torch.where(
+        sums > 0,
+        raw_barycentric_coords / torch.where(sums > 0, sums, 1.0),
+        1.0 / raw_barycentric_coords.shape[-1],
+    )
 
     ### Compute weighted combination of cell vertices
     # Get the vertices for the selected cells: (n_samples, n_manifold_dims + 1, n_spatial_dims)

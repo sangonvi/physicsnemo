@@ -25,6 +25,7 @@ import torch
 
 from physicsnemo.mesh.mesh import Mesh
 from physicsnemo.mesh.spatial import BVH
+from physicsnemo.mesh.spatial import bvh as bvh_module
 from physicsnemo.mesh.spatial.bvh import _compute_morton_codes
 
 ### Helper Functions ###
@@ -112,6 +113,35 @@ class TestMortonCodes:
         codes = _compute_morton_codes(points)
         assert (codes >= 0).all()
 
+    @pytest.mark.parametrize(
+        "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+    )
+    def test_1d_maximum_endpoint_does_not_overflow(self, dtype):
+        """The maximum 1D coordinate must sort after interior coordinates."""
+        points = torch.tensor([[0.0], [0.5], [1.0]], dtype=dtype)
+
+        codes = _compute_morton_codes(points)
+
+        assert (codes >= 0).all()
+        assert codes[0] < codes[1] < codes[2]
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_low_precision_quantization_matches_float32_arithmetic(self, dtype):
+        points = torch.tensor(
+            [
+                [0.4961, 0.7695],
+                [0.0884, 0.1318],
+                [0.3066, 0.6328],
+                [0.4902, 0.8945],
+                [0.4551, 0.6328],
+            ],
+            dtype=dtype,
+        )
+
+        codes = _compute_morton_codes(points)
+
+        assert torch.equal(codes, _compute_morton_codes(points.float()))
+
     def test_spatial_locality_2d(self):
         """Nearby 2D points should have nearby morton codes."""
         # Two clusters: one near origin, one far away
@@ -157,15 +187,41 @@ class TestMortonCodes:
         """Morton codes work for a single point."""
         codes = _compute_morton_codes(torch.tensor([[1.0, 2.0, 3.0]]))
         assert codes.shape == (1,)
-        # Single point: all dimensions map to the same value, code = 0 or max
-        # Since min == max, extent is clamped, coordinates map to max_val
-        assert codes[0] >= 0
+        assert codes[0] == 0
 
     def test_identical_points(self):
         """All identical points produce the same code."""
         points = torch.ones(10, 3) * 5.0
         codes = _compute_morton_codes(points)
         assert (codes == codes[0]).all()
+
+    def test_tiny_nonzero_extents_preserve_distinct_float64_codes(self, device):
+        """Every representable nonzero extent must use the quantization grid."""
+        steps = torch.arange(5, dtype=torch.float64, device=device).unsqueeze(-1)
+        points = steps * torch.tensor(
+            [[1.0e-40, 2.0e-40, 3.0e-40]], dtype=torch.float64, device=device
+        )
+
+        codes = _compute_morton_codes(points)
+
+        assert len(torch.unique(codes)) == len(points)
+
+    def test_constant_axes_do_not_disturb_varying_axis(self, device):
+        points = torch.tensor(
+            [
+                [0.0, 7.0, -2.0],
+                [0.25, 7.0, -2.0],
+                [0.50, 7.0, -2.0],
+                [1.00, 7.0, -2.0],
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+
+        codes = _compute_morton_codes(points)
+
+        assert len(torch.unique(codes)) == len(points)
+        assert torch.equal(codes, codes.sort().values)
 
     def test_codes_are_deterministic_for_known_centroids(self):
         """Repeated CPU calls on known centroids produce identical codes."""
@@ -185,7 +241,7 @@ class TestMortonCodes:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cuda_codes_match_cpu_for_primitive_mesh_centroids(self):
-        """CUDA vectorized path matches CPU bit-loop path on primitive mesh data."""
+        """CUDA and CPU produce identical codes on primitive mesh data."""
         from physicsnemo.mesh.primitives.surfaces import sphere_icosahedral
 
         mesh = sphere_icosahedral.load(subdivisions=2)
@@ -196,6 +252,41 @@ class TestMortonCodes:
 
         assert torch.equal(cuda_codes, cpu_codes)
 
+    @pytest.mark.parametrize("n_spatial_dims", [1, 2, 3, 4])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_codes_match_per_bit_interleave(self, device, n_spatial_dims, dtype):
+        """Codes equal a bit-by-bit interleave of the quantized coordinates."""
+        g = torch.Generator().manual_seed(0)
+        points = torch.rand(500, n_spatial_dims, generator=g, dtype=dtype).to(device)
+
+        ### Reference: the same quantization, then one bit of one axis at a time.
+        n_bits = min(62, 63 // n_spatial_dims)
+        max_val = (1 << n_bits) - 1
+        cmin, cmax = points.min(dim=0).values, points.max(dim=0).values
+        coords = ((points - cmin) / (cmax - cmin) * max_val).long().clamp(0, max_val)
+        expected = torch.zeros(len(points), dtype=torch.int64, device=device)
+        for b in range(n_bits):
+            for d in range(n_spatial_dims):
+                expected |= ((coords[:, d] >> b) & 1) << (b * n_spatial_dims + d)
+
+        assert torch.equal(_compute_morton_codes(points), expected)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_peak_memory_is_linear_in_points(self):
+        """Temporaries are a few (N, D) arrays, not one int64 per bit."""
+        n_points = 1 << 16
+        points = torch.rand(n_points, 3, device="cuda")
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        baseline = torch.cuda.memory_allocated()
+        _compute_morton_codes(points)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - baseline
+
+        # Materializing all 63 bits of every point as int64 needs 504 B per point.
+        assert peak < 128 * n_points
+
     def test_rejects_integer_input(self):
         """Integer centroids should be rejected (would silently corrupt quantization)."""
         with pytest.raises(TypeError, match="floating-point"):
@@ -205,6 +296,18 @@ class TestMortonCodes:
         """1D input should be rejected."""
         with pytest.raises(ValueError, match="2D"):
             _compute_morton_codes(torch.rand(10))
+
+    def test_empty_input_returns_empty_codes(self, device):
+        points = torch.empty((0, 3), device=device)
+        codes = _compute_morton_codes(points)
+
+        assert codes.shape == (0,)
+        assert codes.dtype == torch.int64
+        assert codes.device == points.device
+
+    def test_rejects_zero_spatial_dimensions(self):
+        with pytest.raises(ValueError, match="at least one spatial dimension"):
+            _compute_morton_codes(torch.empty((2, 0)))
 
 
 ### Construction Tests ###
@@ -480,6 +583,28 @@ class TestBVHTraversal:
                 f"Query {i}: leaf_size=1 found {set_1}, leaf_size=8 found {set_8}. "
                 f"Missing: {set_1 - set_8}"
             )
+
+    @pytest.mark.parametrize("max_candidates", [None, 2])
+    def test_query_slices_match_single_traversal(self, monkeypatch, max_candidates):
+        """Traversing queries in slices gives the same adjacency as one pass."""
+        torch.manual_seed(0)
+        points = torch.rand(40, 2)
+        cells = torch.randint(0, 40, (60, 3))
+        bvh = BVH.from_mesh(Mesh(points=points, cells=cells), leaf_size=2)
+        query = torch.rand(23, 2)
+
+        monkeypatch.setattr(bvh_module, "_QUERY_CHUNK_SIZE", 1000)
+        whole = bvh.find_candidate_cells(
+            query, max_candidates_per_point=max_candidates, aabb_tolerance=0.05
+        )
+        monkeypatch.setattr(bvh_module, "_QUERY_CHUNK_SIZE", 5)
+        sliced = bvh.find_candidate_cells(
+            query, max_candidates_per_point=max_candidates, aabb_tolerance=0.05
+        )
+
+        assert whole.n_total_neighbors > query.shape[0]
+        assert torch.equal(sliced.offsets, whole.offsets)
+        assert torch.equal(sliced.indices, whole.indices)
 
 
 ### Device Handling Tests ###
